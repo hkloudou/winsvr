@@ -30,3 +30,11 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Generated Windows resource objects (regenerate with `make res`)
+*.syso
+
+# Build output
+/dist/
+# payload state written at runtime
+*.state
