@@ -2,76 +2,43 @@ package winsvr
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/hkloudou/winsvr/session"
-	"github.com/hkloudou/winsvr/update"
 )
 
-// RunPolicy controls how and where the payload binary is launched.
-type RunPolicy struct {
-	// Args are passed to the payload.
-	Args []string
-	// Elevated launches the payload with the user's linked admin token (no UAC
-	// prompt, since the service runs as LocalSystem). Requires the payload to
-	// be manifested "asInvoker" or "requireAdministrator"; a "requireAdministrator"
-	// payload MUST set Elevated, or it cannot start.
-	Elevated bool
-	// Hidden launches the payload with no console window. Recommended for
-	// background helpers; also build the payload with `-ldflags -H windowsgui`.
-	Hidden bool
-	// MinBackoff and MaxBackoff bound the exponential delay between payload
-	// restarts. Default 2s..30s.
-	MinBackoff, MaxBackoff time.Duration
-	// UpdateInterval, when > 0 and an update Source is set, polls for a newer
-	// payload while it runs (cheap HEAD/sidecar check). When a newer version is
-	// detected the running payload is stopped, the update installed, and the
-	// new payload launched. When 0, updates are only applied between runs
-	// (before each launch and after each exit).
-	UpdateInterval time.Duration
-	// RequireUpdate makes the supervisor refuse to launch a payload it could
-	// not update-check when no local copy exists yet. By default an offline
-	// check is tolerated and the existing payload runs, so boot is not blocked
-	// on the network.
-	RequireUpdate bool
-}
-
-func (p RunPolicy) minBackoff() time.Duration {
-	if p.MinBackoff > 0 {
-		return p.MinBackoff
-	}
-	return 2 * time.Second
-}
-
-func (p RunPolicy) maxBackoff() time.Duration {
-	if p.MaxBackoff > 0 {
-		return p.MaxBackoff
-	}
-	return 30 * time.Second
-}
-
-// Supervisor is a ready-made Service that keeps a payload binary updated from a
-// remote URL and runs it inside the logged-on user's session, restarting it on
-// exit and killing it (and its whole process tree) when the service stops.
+// Supervisor is a ready-made Service that, on startup, brings a payload binary
+// up to date from a URL (a single check — see below), then runs it inside the
+// logged-on user's desktop session, restarting it if it crashes and killing it
+// when the service stops.
 //
-// It implements Service, so run it with Run(cfg.Name, sup, cfg.StopTimeout) or,
-// more simply, build an Agent with NewAgent and call Agent.Main.
+// Update policy: the check happens once, when the service starts (i.e. once per
+// boot for an auto-start service). If a newer payload exists it is downloaded
+// and installed before the payload is launched, so the payload that runs is
+// always the current one. Crash-restarts do not re-check. If the check fails
+// (offline) the existing payload is used, so startup is never blocked on the
+// network.
 type Supervisor struct {
-	// Bin is the payload file name, resolved relative to the service
-	// executable's directory (e.g. "helper.bin"). Required.
+	// Bin is the payload file name, resolved next to the service executable
+	// (e.g. "helper.bin"). Required.
 	Bin string
-	// Update, when non-nil, keeps Bin in sync with a remote copy.
-	Update *update.Source
-	// Policy controls how the payload is launched.
-	Policy RunPolicy
-	// Logger receives structured progress logs. Defaults to a logger writing to
-	// the Windows event log when running as a service (wired by Agent), else a
-	// no-op.
+	// UpdateURL is the remote payload. Empty disables updates.
+	UpdateURL string
+	// Sidecar checks <UpdateURL>.json (version + crc64) instead of HEAD/ETag.
+	Sidecar bool
+	// Elevated launches the payload with the user's elevated token (no UAC
+	// prompt, since the service is LocalSystem). The payload must be manifested
+	// "asInvoker" or "requireAdministrator"; a "requireAdministrator" payload
+	// requires this to be true.
+	Elevated bool
+	// Hidden launches the payload without a console window. Recommended; also
+	// build the payload with `-ldflags -H windowsgui`.
+	Hidden bool
+	// MinBackoff/MaxBackoff bound the exponential restart delay (default 2s/30s).
+	MinBackoff, MaxBackoff time.Duration
+	// Logger receives progress logs. Defaults to no-op; wire NewEventLogger.
 	Logger *slog.Logger
 
 	dir string
@@ -84,8 +51,7 @@ func (s *Supervisor) log() *slog.Logger {
 	return slog.New(discardHandler{})
 }
 
-// BinPath returns the absolute path of the payload binary.
-func (s *Supervisor) BinPath() (string, error) {
+func (s *Supervisor) binPath() (string, error) {
 	if s.dir == "" {
 		exe, err := os.Executable()
 		if err != nil {
@@ -96,147 +62,77 @@ func (s *Supervisor) BinPath() (string, error) {
 	return filepath.Join(s.dir, s.Bin), nil
 }
 
-func (s *Supervisor) updater(binPath string) *update.Updater {
-	if s.Update == nil {
-		return nil
-	}
-	return &update.Updater{Source: *s.Update, Path: binPath}
-}
-
-// Run implements Service. It blocks until ctx is cancelled.
+// Run implements Service.
 func (s *Supervisor) Run(ctx context.Context) error {
 	if s.Bin == "" {
-		return errors.New("winsvr: Supervisor.Bin is required")
+		return fmt.Errorf("winsvr: Supervisor.Bin is required")
 	}
-	binPath, err := s.BinPath()
+	bin, err := s.binPath()
 	if err != nil {
 		return err
 	}
-	launcher, err := session.NewLauncher()
-	if err != nil {
-		return fmt.Errorf("create launcher: %w", err)
+
+	// 1. One update check at startup, while the payload is stopped (so replacing
+	//    the file is safe). Best-effort: an offline check falls back to the
+	//    existing payload.
+	if s.UpdateURL != "" {
+		up := &Updater{URL: s.UpdateURL, Path: bin, Sidecar: s.Sidecar}
+		cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		updated, err := up.EnsureLatest(cctx)
+		cancel()
+		switch {
+		case err != nil:
+			s.log().Warn("update check failed; using existing payload", "err", err)
+		case updated:
+			s.log().Info("payload updated", "path", bin)
+		default:
+			s.log().Info("payload is up to date")
+		}
 	}
-	defer launcher.Close() // kills the payload tree on service stop
+	if _, err := os.Stat(bin); err != nil {
+		return fmt.Errorf("winsvr: payload %q not found and no update produced it", bin)
+	}
 
-	up := s.updater(binPath)
-	backoff := s.Policy.minBackoff()
-
+	// 2. Launch and supervise. No further update checks.
+	min, max := s.MinBackoff, s.MaxBackoff
+	if min <= 0 {
+		min = 2 * time.Second
+	}
+	if max <= 0 {
+		max = 30 * time.Second
+	}
+	backoff := min
 	for ctx.Err() == nil {
-		// Update between runs: the payload is not running, so replacing the
-		// file on disk is always safe here.
-		if up != nil {
-			if err := s.tryUpdate(ctx, up); err != nil {
-				if !fileExists(binPath) && s.Policy.RequireUpdate {
-					s.log().Warn("no payload yet and update failed; retrying", "err", err)
-					if !sleep(ctx, backoff) {
-						return ctx.Err()
-					}
-					backoff = nextBackoff(backoff, s.Policy.maxBackoff())
-					continue
-				}
-				s.log().Warn("update check failed; using existing payload", "err", err)
-			}
+		sid, err := WaitForActiveConsole(ctx, 2*time.Second)
+		if err != nil {
+			return nil // ctx cancelled
 		}
-		if !fileExists(binPath) {
-			return fmt.Errorf("winsvr: payload %q not found and no update source produced it", binPath)
-		}
-
-		restart, err := s.superviseOnce(ctx, launcher, up, binPath)
-		if err != nil && ctx.Err() == nil {
-			s.log().Error("payload supervision error", "err", err)
-		}
-		if ctx.Err() != nil {
-			return nil
-		}
-		if restart {
-			backoff = s.Policy.minBackoff() // an update or clean relaunch resets backoff
-		} else {
+		proc, err := LaunchInSession(sid, LaunchOptions{Path: bin, Elevated: s.Elevated, Hidden: s.Hidden})
+		if err != nil {
+			s.log().Error("launch failed", "err", err)
 			if !sleep(ctx, backoff) {
 				return nil
 			}
-			backoff = nextBackoff(backoff, s.Policy.maxBackoff())
+			backoff = grow(backoff, max)
+			continue
 		}
-	}
-	return nil
-}
-
-// superviseOnce launches the payload once and waits for it to exit, the service
-// to stop, or (when polling) an update to become available. It returns
-// restart=true when the loop should relaunch promptly (update pending), and
-// false when the payload exited on its own (apply backoff).
-func (s *Supervisor) superviseOnce(ctx context.Context, l *session.Launcher, up *update.Updater, binPath string) (restart bool, err error) {
-	sid, err := session.WaitForActiveConsole(ctx, 2*time.Second)
-	if err != nil {
-		return false, err
-	}
-	proc, err := l.Launch(sid, session.LaunchOptions{
-		Path:     binPath,
-		Args:     s.Policy.Args,
-		Elevated: s.Policy.Elevated,
-		Hidden:   s.Policy.Hidden,
-	})
-	if err != nil {
-		return false, err
-	}
-	s.log().Info("payload started", "pid", proc.PID, "session", sid, "path", binPath)
-
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	updatePending := false
-	if up != nil && s.Policy.UpdateInterval > 0 {
-		go func() {
-			t := time.NewTicker(s.Policy.UpdateInterval)
-			defer t.Stop()
-			for {
-				select {
-				case <-runCtx.Done():
-					return
-				case <-t.C:
-					if ok, err := up.Available(runCtx); err == nil && ok {
-						s.log().Info("newer payload available; recycling")
-						updatePending = true
-						cancel()
-						return
-					}
-				}
-			}
-		}()
-	}
-
-	code, werr := proc.Wait(runCtx)
-	if werr != nil { // ctx cancelled: service stopping or update pending
-		_ = proc.Kill()
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, _ = proc.Wait(stopCtx)
-		stopCancel()
-		proc.Close()
+		s.log().Info("payload started", "pid", proc.PID, "session", sid)
+		code, werr := proc.Wait(ctx)
+		proc.Close() // kills the payload tree
 		if ctx.Err() != nil {
-			return false, nil
+			return nil
 		}
-		return updatePending, nil // relaunch promptly if an update is pending
-	}
-	proc.Close()
-	s.log().Info("payload exited", "pid", proc.PID, "code", code)
-	return false, nil // exited on its own -> backoff then relaunch
-}
-
-func (s *Supervisor) tryUpdate(ctx context.Context, up *update.Updater) error {
-	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	res, err := up.EnsureLatest(cctx)
-	if err != nil {
-		return err
-	}
-	if res.Updated {
-		s.log().Info("payload updated", "version", res.State.Version, "etag", res.State.ETag)
+		if werr != nil {
+			s.log().Warn("payload wait error", "err", werr)
+		} else {
+			s.log().Info("payload exited", "code", code)
+		}
+		if !sleep(ctx, backoff) {
+			return nil
+		}
+		backoff = grow(backoff, max)
 	}
 	return nil
-}
-
-func fileExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {
@@ -250,15 +146,14 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func nextBackoff(cur, max time.Duration) time.Duration {
-	cur *= 2
-	if cur > max {
+func grow(cur, max time.Duration) time.Duration {
+	if cur *= 2; cur > max {
 		return max
 	}
 	return cur
 }
 
-// discardHandler is a slog.Handler that drops everything.
+// discardHandler drops all log records.
 type discardHandler struct{}
 
 func (discardHandler) Enabled(context.Context, slog.Level) bool  { return false }

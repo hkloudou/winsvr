@@ -13,7 +13,7 @@ ARCHES   ?= amd64,386
 
 CGO      ?= 0
 GOOS      = windows
-LDCOMMON  = -s -w -X main.version=$(VERSION)
+LDCOMMON  = -s -w
 
 # mingw compilers used only when CGO=1.
 CC_amd64 ?= x86_64-w64-mingw32-gcc

@@ -1,20 +1,19 @@
-// Command example-helper is a stand-in payload ("helper.bin"): the program the
-// winsvr-agent service launches inside the logged-on user's desktop session.
+// Command example-helper is the payload ("helper.bin"): the program the service
+// launches inside the logged-on user's desktop session. THIS IS WHERE YOUR REAL
+// PROGRAM GOES — it runs as the interactive user, not as LocalSystem.
 //
-// It writes a heartbeat file into the current user's temp directory every few
-// seconds, so you can confirm it is running as the interactive user (check the
-// file's owner) and not as LocalSystem. Replace it with your real workload.
+// This example writes a heartbeat file into the user's temp directory every few
+// seconds, so you can confirm (by the file's owner) that it runs as the user.
+// Replace main's body with your own work.
 //
-// Build it as a windowless binary so no console flashes when the service starts
-// it, and manifest it "asInvoker" so it can run as a standard user:
+// Build it windowless so nothing flashes when the service starts it:
 //
-//	go-winres simply --manifest gui --arch amd64,386 --out cmd/example-helper/rsrc \
-//	  --product-name helper --file-version git-tag --product-version git-tag
 //	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath \
 //	  -ldflags "-s -w -H windowsgui" -o helper.bin ./cmd/example-helper
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -23,28 +22,23 @@ import (
 	"time"
 )
 
-var version = "dev"
-
 func main() {
-	ctx := make(chan os.Signal, 1)
-	signal.Notify(ctx, os.Interrupt, syscall.SIGTERM)
+	// The service stops the payload by terminating it; also handle signals so
+	// `helper.bin` behaves when run directly during development.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	path := filepath.Join(os.TempDir(), "winsvr-helper-heartbeat.txt")
-	user := os.Getenv("USERNAME")
-	if user == "" {
-		user = "?"
-	}
+	heartbeat := filepath.Join(os.TempDir(), "winsvr-helper.txt")
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
-
 	write := func() {
-		line := fmt.Sprintf("%s alive as %s pid=%d version=%s\n", time.Now().Format(time.RFC3339), user, os.Getpid(), version)
-		_ = os.WriteFile(path, []byte(line), 0o644)
+		line := fmt.Sprintf("%s alive as %s pid=%d\n", time.Now().Format(time.RFC3339), os.Getenv("USERNAME"), os.Getpid())
+		_ = os.WriteFile(heartbeat, []byte(line), 0o644)
 	}
 	write()
 	for {
 		select {
-		case <-ctx:
+		case <-ctx.Done():
 			return
 		case <-tick.C:
 			write()

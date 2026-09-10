@@ -11,10 +11,9 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 )
 
-// NewEventLogger opens the Windows event-log source named source (created at
-// install time by Install) and returns an *slog.Logger that writes to it, plus
-// a close function. Levels map to the event log as: >=Error -> Error,
-// >=Warn -> Warning, else Information.
+// NewEventLogger opens the event-log source created by Install and returns an
+// *slog.Logger writing to it, plus a close func. Levels map to Error/Warning/
+// Information. A service has no stdout, so this is the natural place to log.
 func NewEventLogger(source string) (*slog.Logger, func() error, error) {
 	l, err := eventlog.Open(source)
 	if err != nil {
@@ -26,43 +25,21 @@ func NewEventLogger(source string) (*slog.Logger, func() error, error) {
 type eventLogHandler struct {
 	log   *eventlog.Log
 	attrs []slog.Attr
-	group string
 }
 
 func (h *eventLogHandler) Enabled(context.Context, slog.Level) bool { return true }
-
 func (h *eventLogHandler) WithAttrs(a []slog.Attr) slog.Handler {
-	nh := *h
-	nh.attrs = append(append([]slog.Attr{}, h.attrs...), a...)
-	return &nh
+	return &eventLogHandler{log: h.log, attrs: append(append([]slog.Attr{}, h.attrs...), a...)}
 }
-
-func (h *eventLogHandler) WithGroup(name string) slog.Handler {
-	nh := *h
-	if nh.group != "" {
-		nh.group += "." + name
-	} else {
-		nh.group = name
-	}
-	return &nh
-}
-
+func (h *eventLogHandler) WithGroup(string) slog.Handler { return h }
 func (h *eventLogHandler) Handle(_ context.Context, r slog.Record) error {
 	var b strings.Builder
 	b.WriteString(r.Message)
-	writeAttr := func(a slog.Attr) {
-		if h.group != "" {
-			fmt.Fprintf(&b, " %s.%s=%v", h.group, a.Key, a.Value)
-		} else {
-			fmt.Fprintf(&b, " %s=%v", a.Key, a.Value)
-		}
-	}
 	for _, a := range h.attrs {
-		writeAttr(a)
+		fmt.Fprintf(&b, " %s=%v", a.Key, a.Value)
 	}
-	r.Attrs(func(a slog.Attr) bool { writeAttr(a); return true })
-	msg := b.String()
-	switch {
+	r.Attrs(func(a slog.Attr) bool { fmt.Fprintf(&b, " %s=%v", a.Key, a.Value); return true })
+	switch msg := b.String(); {
 	case r.Level >= slog.LevelError:
 		return h.log.Error(1, msg)
 	case r.Level >= slog.LevelWarn:
