@@ -25,25 +25,25 @@ all: res agent helper
 
 ## res: generate .syso resources (icon + manifest + version) for both binaries
 res:
-	cd cmd/winsvr-agent/winres && $(GOWINRES) make --in winres.json --arch $(ARCHES) \
+	cd example/agent/winres && $(GOWINRES) make --in winres.json --arch $(ARCHES) \
 	  --out ../rsrc --product-version $(VERSION) --file-version $(VERSION)
-	cd cmd/example-helper/winres && $(GOWINRES) make --in winres.json --arch $(ARCHES) \
+	cd example/helper/winres && $(GOWINRES) make --in winres.json --arch $(ARCHES) \
 	  --out ../rsrc --product-version $(VERSION) --file-version $(VERSION)
 
 ## agent: build the service binary (amd64), console subsystem
 agent:
 	CGO_ENABLED=$(CGO) GOOS=$(GOOS) GOARCH=amd64 $(if $(filter 1,$(CGO)),CC=$(CC_amd64),) \
-	  go build -trimpath -ldflags "$(LDCOMMON)" -o dist/winsvr-agent.exe ./cmd/winsvr-agent
+	  go build -trimpath -ldflags "$(LDCOMMON)" -o dist/winsvr-agent.exe ./example/agent
 
 ## helper: build the payload as helper.bin (amd64), windowless subsystem
 helper:
 	CGO_ENABLED=$(CGO) GOOS=$(GOOS) GOARCH=amd64 $(if $(filter 1,$(CGO)),CC=$(CC_amd64),) \
-	  go build -trimpath -ldflags "$(LDCOMMON) -H windowsgui" -o dist/helper.bin ./cmd/example-helper
+	  go build -trimpath -ldflags "$(LDCOMMON) -H windowsgui" -o dist/helper.bin ./example/helper
 
 ## helper32: same payload for 32-bit Windows
 helper32:
 	CGO_ENABLED=$(CGO) GOOS=$(GOOS) GOARCH=386 $(if $(filter 1,$(CGO)),CC=$(CC_386),) \
-	  go build -trimpath -ldflags "$(LDCOMMON) -H windowsgui" -o dist/helper-386.bin ./cmd/example-helper
+	  go build -trimpath -ldflags "$(LDCOMMON) -H windowsgui" -o dist/helper-386.bin ./example/helper
 
 ## tools: install the resource compiler
 tools:
@@ -60,4 +60,4 @@ vet:
 
 clean:
 	rm -rf dist
-	rm -f cmd/*/rsrc_windows_*.syso
+	rm -f example/*/rsrc_windows_*.syso

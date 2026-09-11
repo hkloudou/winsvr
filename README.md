@@ -33,8 +33,8 @@ binaries**. Keep them straight and everything else follows:
 | manifest | `requireAdministrator`, console subsystem | `asInvoker`, windowless (`-H windowsgui`) |
 
 **Write your program in the payload.** The service is plumbing you configure and
-mostly leave alone; `cmd/winsvr-agent` is a ~90-line template you copy and edit.
-Your code goes in the payload (`cmd/example-helper` shows where), because that is
+mostly leave alone; `example/agent` is a ~90-line template you copy and edit.
+Your code goes in the payload (`example/helper` shows where), because that is
 what runs *as the user*.
 
 Why it has to be split:
@@ -79,15 +79,29 @@ sup := &winsvr.Supervisor{
 winsvr.Run(config.Name, sup, config.StopTimeout)   // SCM when a service; console otherwise
 ```
 
-`cmd/winsvr-agent` wires this to a small CLI (no flags — configuration is code
+`example/agent` wires this to a small CLI (no flags — configuration is code
 you own):
 
 ```sh
-winsvr-agent install     # register + start; self-elevates via UAC
-winsvr-agent status
-winsvr-agent uninstall
-winsvr-agent run         # foreground, Ctrl+C to stop — for debugging
+agent               # double-click in Explorer: toggles install/uninstall, with a popup
+agent install       # register + start; self-elevates via UAC
+agent status
+agent uninstall
+agent run           # foreground, Ctrl+C to stop — for debugging
 ```
+
+### Double-click: install / uninstall with a popup
+
+Double-clicking the exe in Explorer toggles the service — install + start if it
+is not present, uninstall if it is — then shows a message box with the result.
+It tells a double-click apart from a shell run (and from the SCM) by whether it
+owns a brand-new console alone (`GetConsoleProcessList == 1`); on a double-click
+a console would vanish when the process exits, so feedback goes to a dialog
+instead of stdout. Install and uninstall self-elevate through UAC.
+
+Uninstall stops the service and waits for it to actually stop before removing
+it — and stopping the service terminates the helper (its job object closes), so
+a **reinstall replaces a cleanly stopped helper**, never a locked, running one.
 
 ### Update policy: checked once, at startup
 
@@ -144,9 +158,9 @@ Behind `make`:
 
 ```sh
 # service: console subsystem so install/uninstall can print
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w"               -o dist/winsvr-agent.exe ./cmd/winsvr-agent
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w"               -o dist/winsvr-agent.exe ./example/agent
 # payload: no console window (-H windowsgui) so nothing flashes when it launches
-CGO_ENABLED=0 GOOS=windows GOARCH=386  go build -trimpath -ldflags "-s -w -H windowsgui" -o dist/helper.bin      ./cmd/example-helper
+CGO_ENABLED=0 GOOS=windows GOARCH=386  go build -trimpath -ldflags "-s -w -H windowsgui" -o dist/helper.bin      ./example/helper
 ```
 
 **Building with cgo from macOS?** Install mingw-w64 and pass `CGO=1`
@@ -163,10 +177,10 @@ manifest (an RT_MANIFEST resource) are independent — the payload wants both.
 ## Layout
 
 ```
-winsvr.go, service_*, manager_*, session_*, eventlog_*   the winsvr package
-update.go, supervisor.go                                 update + the recipe (pure Go)
-cmd/winsvr-agent/    the service — a template you copy and edit (no business logic)
-cmd/example-helper/  the payload — where YOUR program goes (runs as the user)
+winsvr.go, service_*, manager_*, session_*, eventlog_*, interact_*   the winsvr package
+update.go, supervisor.go                                             update + the recipe (pure Go)
+example/agent/    the service — an example template you copy and edit (no business logic)
+example/helper/   the payload — where YOUR program goes (runs as the user)
 ```
 
 Everything compiles on all platforms; Windows-only calls return `ErrUnsupported`

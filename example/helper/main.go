@@ -9,7 +9,7 @@
 // Build it windowless so nothing flashes when the service starts it:
 //
 //	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath \
-//	  -ldflags "-s -w -H windowsgui" -o helper.bin ./cmd/example-helper
+//	  -ldflags "-s -w -H windowsgui" -o helper.bin ./example/helper
 package main
 
 import (

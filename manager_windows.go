@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -86,7 +87,21 @@ func Uninstall(name string) error {
 		return err
 	}
 	defer s.Close()
-	_, _ = s.Control(svc.Stop)
+	// Stop the service and wait for it to actually reach Stopped before
+	// deleting. Stopping cancels the service's context, which makes the
+	// Supervisor terminate the payload (its job object is closed), so by the
+	// time this returns the old helper is gone and its file is unlocked — which
+	// is what makes a reinstall replace the helper cleanly.
+	if status, err := s.Control(svc.Stop); err == nil && status.State != svc.Stopped {
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			st, qerr := s.Query()
+			if qerr != nil || st.State == svc.Stopped {
+				break
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
 	if err := s.Delete(); err != nil {
 		return fmt.Errorf("delete service: %w", err)
 	}
@@ -96,10 +111,29 @@ func Uninstall(name string) error {
 	return nil
 }
 
-// Status reports the current state of the named service.
+// Status reports the current state of the named service. It needs only
+// read-only query access, so it works without administrator rights. A missing
+// service surfaces as an error wrapping ERROR_SERVICE_DOES_NOT_EXIST.
 func Status(name string) (ServiceState, error) {
-	st, err := query(name, func(s *mgr.Service) (svc.Status, error) { return s.Query() })
-	return ServiceState(st.State), err
+	scm, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
+	if err != nil {
+		return 0, fmt.Errorf("connect SCM: %w", err)
+	}
+	defer windows.CloseServiceHandle(scm)
+	np, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return 0, err
+	}
+	h, err := windows.OpenService(scm, np, windows.SERVICE_QUERY_STATUS)
+	if err != nil {
+		return 0, err
+	}
+	defer windows.CloseServiceHandle(h)
+	var st windows.SERVICE_STATUS
+	if err := windows.QueryServiceStatus(h, &st); err != nil {
+		return 0, err
+	}
+	return ServiceState(st.CurrentState), nil
 }
 
 // Start starts an installed service.
@@ -110,20 +144,6 @@ func Start(name string, args ...string) error {
 // Stop asks an installed service to stop.
 func Stop(name string) error {
 	return control(name, func(s *mgr.Service) error { _, err := s.Control(svc.Stop); return err })
-}
-
-func query(name string, fn func(*mgr.Service) (svc.Status, error)) (svc.Status, error) {
-	m, err := mgr.Connect()
-	if err != nil {
-		return svc.Status{}, err
-	}
-	defer m.Disconnect()
-	s, err := m.OpenService(name)
-	if err != nil {
-		return svc.Status{}, err
-	}
-	defer s.Close()
-	return fn(s)
 }
 
 func control(name string, fn func(*mgr.Service) error) error {
