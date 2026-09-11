@@ -53,6 +53,12 @@ func (s *Supervisor) log() *slog.Logger {
 	return slog.New(discardHandler{})
 }
 
+// ServiceLogger implements Logged, so winsvr.Run logs framework events (such as
+// Run returning an error) to the Supervisor's logger.
+func (s *Supervisor) ServiceLogger() *slog.Logger { return s.log() }
+
+var _ Logged = (*Supervisor)(nil)
+
 func (s *Supervisor) binPath() (string, error) {
 	if s.dir == "" {
 		exe, err := os.Executable()
@@ -68,10 +74,13 @@ func (s *Supervisor) binPath() (string, error) {
 func (s *Supervisor) Run(ctx context.Context) error {
 	log := s.log()
 	if s.Bin == "" {
-		return fmt.Errorf("winsvr: Supervisor.Bin is required")
+		err := fmt.Errorf("winsvr: Supervisor.Bin is required")
+		log.Error("cannot start service", "err", err)
+		return err
 	}
 	bin, err := s.binPath()
 	if err != nil {
+		log.Error("cannot resolve payload path", "err", err)
 		return err
 	}
 	log.Info("service starting",
@@ -92,7 +101,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		log.Info("auto-update disabled; launching existing payload")
 	}
 	if _, err := os.Stat(bin); err != nil {
-		return fmt.Errorf("winsvr: payload %q not found: %w", bin, err)
+		e := fmt.Errorf("winsvr: payload %q not found: %w", bin, err)
+		log.Error("payload not found; service will exit", "path", bin, "err", err)
+		return e
 	}
 
 	// 2. Launch and supervise. No further update checks until the next service

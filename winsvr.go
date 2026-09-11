@@ -15,11 +15,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 )
 
 // ErrUnsupported is returned by Windows-only calls on other platforms.
 var ErrUnsupported = errors.New("winsvr: only supported on windows")
+
+// Logged is an optional interface a Service may implement so winsvr.Run can log
+// framework-level events to the service's own logger — most importantly, the
+// error returned when Run exits unexpectedly, which would otherwise be silent.
+// Supervisor implements it.
+type Logged interface {
+	ServiceLogger() *slog.Logger
+}
 
 // Service is what you implement. Run is called once and must block until ctx is
 // cancelled — which happens when the service is asked to stop or the machine

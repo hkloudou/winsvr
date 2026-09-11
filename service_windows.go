@@ -45,8 +45,18 @@ func (h *handler) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 	s <- svc.Status{State: svc.Running, Accepts: accepted}
 	for {
 		select {
-		case <-done:
+		case err := <-done:
+			// The service's Run returned on its own (not via a stop request).
+			// A nil error is a clean exit; a non-nil error must not be silent —
+			// log it (when the Service exposes a logger) and report a failure
+			// exit code so the SCM records it and any recovery action fires.
 			s <- svc.Status{State: svc.StopPending}
+			if err != nil {
+				if lg, ok := h.svc.(Logged); ok {
+					lg.ServiceLogger().Error("service stopped: Run returned an error", "err", err)
+				}
+				return true, 1
+			}
 			return false, 0
 		case c := <-r:
 			switch c.Cmd {
