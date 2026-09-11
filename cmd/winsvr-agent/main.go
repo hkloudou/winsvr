@@ -16,6 +16,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -97,8 +98,8 @@ func dispatch(cmd string) error {
 		fmt.Printf("%s: %s\n", config.Name, st)
 		return nil
 	case "run":
-		logger, closeLog, err := winsvr.NewEventLogger(config.Name)
-		if err == nil {
+		logger, closeLog := runLogger()
+		if closeLog != nil {
 			defer closeLog()
 		}
 		sup := supervisor()
@@ -107,6 +108,20 @@ func dispatch(cmd string) error {
 	default:
 		return fmt.Errorf("unknown command %q (install|uninstall|status|run)", cmd)
 	}
+}
+
+// runLogger returns the logger for the "run" command: the Windows Event Log when
+// running as a service (a service has no console), and verbose stderr logging
+// when started interactively — so `winsvr-agent run` in a terminal shows the
+// full trace for debugging.
+func runLogger() (*slog.Logger, func() error) {
+	if isSvc, _ := winsvr.IsWindowsService(); isSvc {
+		if l, closeLog, err := winsvr.NewEventLogger(config.Name); err == nil {
+			return l, closeLog
+		}
+	}
+	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+	return slog.New(h), nil
 }
 
 // selfElevate re-runs the current command as administrator if it is not already

@@ -64,3 +64,7 @@ func (h *handler) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 		}
 	}
 }
+
+// IsWindowsService reports whether the current process is running as a Windows
+// service (vs. an interactive console run). Handy for choosing a logger.
+func IsWindowsService() (bool, error) { return svc.IsWindowsService() }

@@ -27,7 +27,7 @@ type eventLogHandler struct {
 	attrs []slog.Attr
 }
 
-func (h *eventLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *eventLogHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= slog.LevelInfo }
 func (h *eventLogHandler) WithAttrs(a []slog.Attr) slog.Handler {
 	return &eventLogHandler{log: h.log, attrs: append(append([]slog.Attr{}, h.attrs...), a...)}
 }

@@ -49,7 +49,7 @@ Why it has to be split:
 ```
 boot ─▶ SCM starts winsvr-agent (SYSTEM)
           │
-          ├─ 1. update check (once): HEAD helper.bin → newer? download + swap
+          ├─ 1. wait for network, then update check: HEAD helper.bin → newer? download + swap
           ├─ 2. wait for a signed-in user, then CreateProcessAsUser(helper.bin)
           └─ 3. supervise: restart on crash · kill the tree on service stop
                              helper.bin runs here, as the user ◀── your code
@@ -91,17 +91,21 @@ winsvr-agent run         # foreground, Ctrl+C to stop — for debugging
 
 ### Update policy: checked once, at startup
 
-The payload is updated **only when the service starts** (i.e. once per boot for
-an auto-start service). The sequence guarantees the payload that runs is current:
+The payload is updated **only when the service starts** — once per boot for an
+auto-start service, and again on every SCM restart — and always **before** the
+payload is launched. The sequence guarantees the payload that runs is current:
 
-1. `HEAD` the URL; if the payload is newer (or missing), `GET`, verify, atomic
+1. **Wait for the network.** The check is retried until it succeeds, so a
+   machine that boots offline does not run a possibly-stale payload; it waits
+   for connectivity first. Retries and errors are logged.
+2. `HEAD` the URL; if the payload is newer (or missing), `GET`, verify, atomic
    swap — done while the payload is stopped, so replacing the file is safe.
-2. Launch the now-current payload in the user's session.
-3. Supervise it (restart on crash). **No further update checks** until the next
+3. Launch the now-current payload in the user's session.
+4. Supervise it (restart on crash). **No further update checks** until the next
    service start.
 
-An offline check does not block startup — the existing payload runs. Pick the
-strategy with one field:
+Crash-restarts of the payload reuse the current binary; a fresh check happens
+only the next time the service itself starts. Pick the strategy with one field:
 
 ```go
 &winsvr.Supervisor{Bin: "helper.bin", UpdateURL: url}                 // HEAD: ETag / Content-Length

@@ -9,36 +9,38 @@ import (
 	"time"
 )
 
-// Supervisor is a ready-made Service that, on startup, brings a payload binary
-// up to date from a URL (a single check — see below), then runs it inside the
-// logged-on user's desktop session, restarting it if it crashes and killing it
-// when the service stops.
+// Supervisor is a ready-made Service that, each time the service starts, brings
+// a payload binary up to date from a URL and then runs it inside the logged-on
+// user's desktop session, restarting it if it crashes and killing it when the
+// service stops.
 //
-// Update policy: the check happens once, when the service starts (i.e. once per
-// boot for an auto-start service). If a newer payload exists it is downloaded
-// and installed before the payload is launched, so the payload that runs is
-// always the current one. Crash-restarts do not re-check. If the check fails
-// (offline) the existing payload is used, so startup is never blocked on the
-// network.
+// Update timing: the check runs once per service start (i.e. once per boot for
+// an auto-start service, and again on every SCM restart), and always *before*
+// the payload is launched. It waits for the network: the check is retried until
+// it succeeds, so a machine that boots offline does not run a possibly-stale
+// payload — it waits until connectivity returns, confirms the payload is
+// current, and only then launches it. Crash-restarts of the payload do not
+// re-check; a fresh check happens the next time the service itself starts.
 type Supervisor struct {
 	// Bin is the payload file name, resolved next to the service executable
 	// (e.g. "helper.bin"). Required.
 	Bin string
-	// UpdateURL is the remote payload. Empty disables updates.
+	// UpdateURL is the remote payload. Empty disables updates (the local Bin is
+	// launched directly, with no network wait).
 	UpdateURL string
 	// Sidecar checks <UpdateURL>.json (version + crc64) instead of HEAD/ETag.
 	Sidecar bool
 	// Elevated launches the payload with the user's elevated token (no UAC
-	// prompt, since the service is LocalSystem). The payload must be manifested
-	// "asInvoker" or "requireAdministrator"; a "requireAdministrator" payload
-	// requires this to be true.
+	// prompt, since the service is LocalSystem). A "requireAdministrator"
+	// payload requires this; an "asInvoker" payload should leave it false.
 	Elevated bool
 	// Hidden launches the payload without a console window. Recommended; also
 	// build the payload with `-ldflags -H windowsgui`.
 	Hidden bool
 	// MinBackoff/MaxBackoff bound the exponential restart delay (default 2s/30s).
 	MinBackoff, MaxBackoff time.Duration
-	// Logger receives progress logs. Defaults to no-op; wire NewEventLogger.
+	// Logger receives progress logs. Defaults to no-op; wire NewEventLogger for
+	// a service, or a stderr slog handler for interactive debugging.
 	Logger *slog.Logger
 
 	dir string
@@ -64,6 +66,7 @@ func (s *Supervisor) binPath() (string, error) {
 
 // Run implements Service.
 func (s *Supervisor) Run(ctx context.Context) error {
+	log := s.log()
 	if s.Bin == "" {
 		return fmt.Errorf("winsvr: Supervisor.Bin is required")
 	}
@@ -71,29 +74,29 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	log.Info("service starting",
+		"payload", bin,
+		"updateURL", s.UpdateURL,
+		"sidecar", s.Sidecar,
+		"elevated", s.Elevated,
+		"hidden", s.Hidden)
 
-	// 1. One update check at startup, while the payload is stopped (so replacing
-	//    the file is safe). Best-effort: an offline check falls back to the
-	//    existing payload.
+	// 1. Update check — before the payload runs, and only after the network is
+	//    up (retried until it succeeds).
 	if s.UpdateURL != "" {
-		up := &Updater{URL: s.UpdateURL, Path: bin, Sidecar: s.Sidecar}
-		cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		updated, err := up.EnsureLatest(cctx)
-		cancel()
-		switch {
-		case err != nil:
-			s.log().Warn("update check failed; using existing payload", "err", err)
-		case updated:
-			s.log().Info("payload updated", "path", bin)
-		default:
-			s.log().Info("payload is up to date")
+		if err := s.updateBeforeLaunch(ctx, bin); err != nil {
+			log.Info("service stopping before first launch", "reason", err)
+			return nil // ctx cancelled while waiting for the network
 		}
+	} else {
+		log.Info("auto-update disabled; launching existing payload")
 	}
 	if _, err := os.Stat(bin); err != nil {
-		return fmt.Errorf("winsvr: payload %q not found and no update produced it", bin)
+		return fmt.Errorf("winsvr: payload %q not found: %w", bin, err)
 	}
 
-	// 2. Launch and supervise. No further update checks.
+	// 2. Launch and supervise. No further update checks until the next service
+	//    start.
 	min, max := s.MinBackoff, s.MaxBackoff
 	if min <= 0 {
 		min = 2 * time.Second
@@ -103,29 +106,35 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 	backoff := min
 	for ctx.Err() == nil {
+		log.Debug("waiting for an active user session")
 		sid, err := WaitForActiveConsole(ctx, 2*time.Second)
 		if err != nil {
-			return nil // ctx cancelled
+			log.Info("service stopping", "reason", err)
+			return nil
 		}
+		log.Info("launching payload", "session", sid, "path", bin)
 		proc, err := LaunchInSession(sid, LaunchOptions{Path: bin, Elevated: s.Elevated, Hidden: s.Hidden})
 		if err != nil {
-			s.log().Error("launch failed", "err", err)
+			log.Error("launch failed; will retry", "err", err, "backoff", backoff.String())
 			if !sleep(ctx, backoff) {
 				return nil
 			}
 			backoff = grow(backoff, max)
 			continue
 		}
-		s.log().Info("payload started", "pid", proc.PID, "session", sid)
+		log.Info("payload running", "pid", proc.PID, "session", sid)
+		backoff = min // a successful launch resets the restart backoff
+
 		code, werr := proc.Wait(ctx)
-		proc.Close() // kills the payload tree
+		proc.Close() // terminates the payload process tree via the job object
 		if ctx.Err() != nil {
+			log.Info("service stopping; payload terminated", "pid", proc.PID)
 			return nil
 		}
 		if werr != nil {
-			s.log().Warn("payload wait error", "err", werr)
+			log.Warn("payload wait error; will restart", "pid", proc.PID, "err", werr, "backoff", backoff.String())
 		} else {
-			s.log().Info("payload exited", "code", code)
+			log.Warn("payload exited; will restart", "pid", proc.PID, "code", code, "backoff", backoff.String())
 		}
 		if !sleep(ctx, backoff) {
 			return nil
@@ -133,6 +142,37 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		backoff = grow(backoff, max)
 	}
 	return nil
+}
+
+// updateBeforeLaunch runs the update check and installs a newer payload, waiting
+// for the network by retrying until the check succeeds or ctx is cancelled.
+func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
+	log := s.log()
+	up := &Updater{URL: s.UpdateURL, Path: bin, Sidecar: s.Sidecar}
+
+	const maxWait = 60 * time.Second
+	wait := 2 * time.Second
+	for attempt := 1; ctx.Err() == nil; attempt++ {
+		log.Debug("checking for payload update", "attempt", attempt, "url", s.UpdateURL)
+		updated, err := up.EnsureLatest(ctx)
+		if err == nil {
+			if updated {
+				log.Info("payload updated to latest", "path", bin)
+			} else {
+				log.Info("payload already up to date")
+			}
+			return nil
+		}
+		// Most commonly this is "no network yet"; keep waiting. Config errors
+		// (bad URL, 404) also land here and repeat in the log so they are easy
+		// to spot while debugging.
+		log.Warn("update check failed; waiting for network", "attempt", attempt, "err", err, "retryIn", wait.String())
+		if !sleep(ctx, wait) {
+			return ctx.Err()
+		}
+		wait = grow(wait, maxWait)
+	}
+	return ctx.Err()
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {
