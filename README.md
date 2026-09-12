@@ -160,9 +160,19 @@ is fixed. The log says which of the two it is.
 #### Where the state lives
 
 ETag mode writes `helper.bin.update.json` next to the payload, holding the ETag
-it last installed and that payload's checksum. The ETag is the reason the file
-exists: unlike a checksum it cannot be recomputed from the bytes on disk, so it
-has to survive a restart.
+it last installed and that payload's checksum.
+
+The ETag is the reason the file exists. HTTP defines it as an **opaque**
+validator, so it cannot be assumed to follow from the payload's content. Some
+servers do make it a content hash, and S3 uses the MD5 hex for a single-part
+upload. Many do not: nginx builds it from the modification time and the length,
+Apache from the modification time and the size, and an S3 multipart upload gives
+a digest of the part digests rather than of the file. Redeploying identical bytes
+changes the first two. So the value the server sent has to be stored, because it
+cannot be recomputed.
+
+If you control the server and can publish a content hash, that is what sidecar
+mode is, and it needs no state file.
 
 Sidecar mode keeps **no state at all**. The sidecar already publishes the
 payload's checksum, so comparing that with the file on disk answers both

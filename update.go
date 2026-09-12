@@ -121,9 +121,20 @@ type remote struct {
 // nothing; see ensureSidecar.
 func (u *Updater) statePath() string { return u.Path + ".update.json" }
 
-// updateState is the little that has to survive a restart. Only the ETag truly
-// does: unlike a checksum it cannot be recomputed from the payload on disk. The
-// checksum rides along so ETag mode can still notice a payload that changed
+// updateState is the little that has to survive a restart.
+//
+// The ETag is here because HTTP defines it as an opaque validator, so it cannot
+// be assumed to follow from the payload's content. Some servers do make it a
+// content hash: S3 uses the MD5 hex for a single-part upload. Plenty do not.
+// nginx builds it from the modification time and the length, Apache from the
+// modification time and the size, and an S3 multipart upload gives a digest of
+// the part digests rather than of the file. Redeploying identical bytes changes
+// the first two. So the value the server sent is recorded rather than derived.
+//
+// If you control the server and can publish a content hash, sidecar mode is that
+// arrangement already, and it needs no state file at all.
+//
+// The checksum rides along so ETag mode can still notice a payload that changed
 // locally while the remote stayed put.
 type updateState struct {
 	ETag  string `json:"etag,omitempty"`
