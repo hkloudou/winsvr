@@ -8,8 +8,8 @@ in the logged-on user's desktop session.
   `golang.org/x/sys/windows/svc`.
 - Launch a program **as the interactive user** from a `LocalSystem` service,
   wrapped in a kill-on-close Job Object so it can't outlive the service.
-- **Self-updating**: one cheap `HEAD` check at boot (or a `version`+`crc64`
-  sidecar), verified install, crash-restart.
+- **Self-updating**: one cheap `HEAD` check at boot, a size-capped download that
+  the `GET`'s own `ETag` has to agree with, crash-restart.
 - Builds on every OS — non-Windows gets stubs, so your logic stays testable on
   Linux/macOS CI.
 
@@ -118,49 +118,37 @@ payload is launched. The sequence guarantees the payload that runs is current:
    differs from the one on disk, when there is none, or when the payload no
    longer matches the checksum it is supposed to have. That last case is what
    catches a payload corrupted or replaced locally while the remote stayed put.
-3. **Verify, then swap.** Check the size and the checksum before anything is
-   installed. The swap removes the old file and renames the new one into place,
-   retrying for a moment, so a scanner holding a transient lock cannot leave the
-   machine with no payload at all. It runs while the payload is stopped, so the
-   file is not in use. In ETag mode the validator is recorded from the `GET`
-   rather than the `HEAD`: if a release lands between the two, the body is read
-   again, so what gets stored always describes the bytes on disk.
+3. **Check, then swap.** The validator is recorded from the `GET` rather than the
+   `HEAD`: if a release lands between the two the ETags disagree, and the body is
+   read again, so what gets stored always describes the bytes on disk. The
+   download is also capped, at `DefaultMaxBytes` unless `Updater.MaxBytes` says
+   otherwise. Be clear about what this is not: there is no published digest to
+   check the bytes against, so this is ETag consistency, not verification. The
+   swap then removes the old file and renames the new one into place, retrying
+   for a moment so a scanner holding a transient lock cannot leave the machine
+   with no payload at all. It runs while the payload is stopped, so the file is
+   not in use.
 4. Launch the now-current payload in the user's session.
 5. Supervise it (restart on crash). **No further update checks** until the next
    service start.
 
 Crash-restarts of the payload reuse the current binary; a fresh check happens
-only the next time the service itself starts. Pick the strategy with one field:
-
-```go
-&winsvr.Supervisor{Bin: "helper.bin", UpdateURL: url}                 // HEAD: ETag, required
-&winsvr.Supervisor{Bin: "helper.bin", UpdateURL: url, Sidecar: true}  // GET url+".json": {version, size, crc64}
-```
-
-The sidecar (`helper.bin.json`, e.g.
-`{"version":"1.4.0","size":12345,"crc64":"a1b2…"}`) adds semantic versions and an
-end-to-end CRC-64/ECMA integrity check.
+only the next time the service itself starts.
 
 #### The payload must be identifiable
 
-Neither mode guesses. If the server cannot say which payload it is serving, the
-check fails, it is retried, and **the payload does not launch** until the server
-is fixed. The log says which of the two it is.
+The check does not guess. **An `ETag` header is required**, on the `HEAD` and on
+the `GET`: it is the only validator there is. Comparing `Content-Length` instead
+would compare a number a rebuild can leave unchanged, so a missing `ETag` is
+reported as the server misconfiguration it is. The check then fails, is retried,
+and **the payload does not launch** until the server is fixed.
 
-- **ETag mode requires an `ETag` header**, on the `HEAD` and on the `GET`. It is
-  the only validator this mode has. Comparing `Content-Length` instead would
-  compare a number a rebuild can leave unchanged, so a missing `ETag` is
-  reported as the server misconfiguration it is rather than worked around.
-  On nginx, `ETag` is on by default for static files; S3 and most CDNs send one.
-- **Sidecar mode requires `crc64`.** It is both what the mode compares and what
-  it verifies, so a sidecar without one identifies nothing. Reading it as
-  "nothing to verify" would let a server switch checking off by dropping a
-  field.
+On nginx, `ETag` is on by default for static files; S3 and most CDNs send one.
 
 #### Where the state lives
 
-ETag mode writes `helper.bin.update.json` next to the payload, holding the ETag
-it last installed and that payload's checksum.
+`helper.bin.update.json` sits next to the payload, holding the ETag last
+installed and that payload's checksum.
 
 The ETag is the reason the file exists. HTTP defines it as an **opaque**
 validator, so it cannot be assumed to follow from the payload's content. Some
@@ -171,13 +159,8 @@ a digest of the part digests rather than of the file. Redeploying identical byte
 changes the first two. So the value the server sent has to be stored, because it
 cannot be recomputed.
 
-If you control the server and can publish a content hash, that is what sidecar
-mode is, and it needs no state file.
-
-Sidecar mode keeps **no state at all**. The sidecar already publishes the
-payload's checksum, so comparing that with the file on disk answers both
-questions at once, whether a new release exists and whether the payload is still
-the one that was installed. A leftover state file from ETag mode is deleted.
+The checksum is this library's own, taken from the bytes it installed. It is what
+notices a payload corrupted or replaced on disk while the remote stayed put.
 
 For a large payload on a slow link, `HTTPClient` replaces the default client,
 which allows five minutes for one whole request, body included. Supply your own
@@ -188,12 +171,16 @@ with no `Timeout` and let the service's context bound the transfer instead.
 Read this before pointing `UpdateURL` at anything. The check defends against a
 stale or corrupted payload. It does not defend against an attacker.
 
-- **CRC-64 is not a signature.** It catches accidental corruption. It is not a
-  cryptographic hash, and it is linear, so producing content that matches a
-  given checksum is easy. The sidecar also travels over the same connection as
-  the payload, so whoever can rewrite one can rewrite the other. For
-  authenticity, verify a real signature over the downloaded file against a
-  public key compiled into the service, before it is installed.
+- **The downloaded bytes are never checked against anything.** No digest is
+  published, so a server or CDN that serves the wrong complete body under the
+  expected `ETag` gets those bytes installed, and the checksum taken afterwards
+  then records them as the good copy. The `ETag` says the remote changed; it does
+  not say what it changed to, or who changed it.
+- **The recorded checksum is for corruption, not tampering.** It catches a
+  payload altered on disk after install. CRC-64 is not a cryptographic hash, and
+  it is linear, so producing content that matches a given value is easy. For
+  authenticity, verify a real signature over the download against a public key
+  compiled into the service, before it is installed.
 - **Use HTTPS.** Nothing here rejects an `http://` URL. The default client does
   refuse a redirect that drops TLS, so an `https://` URL cannot be steered onto
   plain HTTP, but that only helps if you started with `https://`.
@@ -202,10 +189,6 @@ stale or corrupted payload. It does not defend against an attacker.
   that directory can replace either binary, and replacing the service exe means
   SYSTEM at the next boot. Install under `%ProgramFiles%`, or anywhere else only
   administrators can write. Never install from a download folder.
-- **`Elevated` is not a privilege boundary.** It launches the payload with the
-  signed-in user's linked admin token, inside that user's own session, where
-  they can debug it or inject into it. It also needs that user to be an
-  administrator: a standard user has no linked token, and the launch fails.
 
 ### Using the primitives directly
 
@@ -246,11 +229,11 @@ CGO_ENABLED=0 GOOS=windows GOARCH=386  go build -trimpath -ldflags "-s -w -H win
 `i686-w64-mingw32-gcc` for 386). `-H windowsgui` (the PE subsystem) and the
 manifest (an RT_MANIFEST resource) are independent — the payload wants both.
 
-> **Don't swap the manifests.** A payload launched as a standard user must be
-> `asInvoker`; a `requireAdministrator` payload can't start via
-> `CreateProcessAsUser` (`ERROR_ELEVATION_REQUIRED`). To run the payload
-> elevated, set `Supervisor.Elevated` (the service holds the user's linked admin
-> token) — don't change its manifest.
+> **Don't swap the manifests.** The payload must be `asInvoker`: a
+> `requireAdministrator` one cannot start through `CreateProcessAsUser` and fails
+> with `ERROR_ELEVATION_REQUIRED`. The payload runs with the signed-in user's own
+> rights, and that is the point of it. Anything that genuinely needs privilege
+> belongs in the service, which already runs as `LocalSystem`.
 
 ## Layout
 

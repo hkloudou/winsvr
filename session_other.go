@@ -8,11 +8,10 @@ import (
 )
 
 type LaunchOptions struct {
-	Path     string
-	Args     []string
-	Dir      string
-	Elevated bool
-	Hidden   bool
+	Path   string
+	Args   []string
+	Dir    string
+	Hidden bool
 }
 
 type Process struct{ PID uint32 }

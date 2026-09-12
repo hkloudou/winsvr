@@ -30,12 +30,6 @@ type Supervisor struct {
 	// UpdateURL is the remote payload. Empty disables updates (the local Bin is
 	// launched directly, with no network wait).
 	UpdateURL string
-	// Sidecar checks <UpdateURL>.json (version + crc64) instead of HEAD/ETag.
-	Sidecar bool
-	// Elevated launches the payload with the user's elevated token (no UAC
-	// prompt, since the service is LocalSystem). A "requireAdministrator"
-	// payload requires this; an "asInvoker" payload should leave it false.
-	Elevated bool
 	// Hidden launches the payload without a console window. Recommended; also
 	// build the payload with `-ldflags -H windowsgui`.
 	Hidden bool
@@ -93,8 +87,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	log.Info("service starting",
 		"payload", bin,
 		"updateURL", s.UpdateURL,
-		"sidecar", s.Sidecar,
-		"elevated", s.Elevated,
 		"hidden", s.Hidden)
 
 	// 1. Update check — before the payload runs, and only after the network is
@@ -149,7 +141,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return nil
 		}
 		log.Info("launching payload", "session", sid, "path", bin)
-		proc, err := LaunchInSession(sid, LaunchOptions{Path: bin, Elevated: s.Elevated, Hidden: s.Hidden})
+		proc, err := LaunchInSession(sid, LaunchOptions{Path: bin, Hidden: s.Hidden})
 		if err != nil {
 			// A user who signed out between the session check and the launch is
 			// not a failure: wait again rather than logging an error and widening
@@ -198,13 +190,13 @@ func (s *Supervisor) Run(ctx context.Context) error {
 
 // updateBeforeLaunch runs the update check and installs a newer payload, retrying
 // until it succeeds or ctx is cancelled. That covers waiting for the network and
-// equally a server that cannot identify its payload, such as one sending no ETag:
-// the payload does not launch until the check passes.
+// equally a server that sends no ETag, and so cannot identify its payload: it
+// does not launch until the check passes.
 func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
 	log := s.log()
 	// Pass the logger so the Updater logs the ETag/version comparison and the
 	// resulting action ("update check ... needsUpdate=... action=...").
-	up := &Updater{URL: s.UpdateURL, Path: bin, Sidecar: s.Sidecar, Client: s.HTTPClient, Logger: log}
+	up := &Updater{URL: s.UpdateURL, Path: bin, Client: s.HTTPClient, Logger: log}
 
 	const maxWait = 60 * time.Second
 	wait := 2 * time.Second
@@ -217,10 +209,9 @@ func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
 		if ctx.Err() != nil {
 			return ctx.Err() // the service is stopping, not an update failure
 		}
-		// Usually "no network yet", so keep waiting. A bad URL, a 404, a missing
-		// ETag and an incomplete sidecar land here too and repeat in the log
-		// rather than being worked around: the payload has to be identifiable
-		// before it runs. The error says which it is.
+		// Usually "no network yet", so keep waiting. A bad URL, a 404 and a
+		// missing ETag land here too and repeat in the log rather than being
+		// worked around: the payload has to be identifiable before it runs.
 		log.Warn("update check failed; will retry", "attempt", attempt, "err", err, "retryIn", wait.String())
 		if !sleep(ctx, wait) {
 			return ctx.Err()

@@ -19,18 +19,6 @@ func TestServiceStateString(t *testing.T) {
 	}
 }
 
-func TestParseCRC(t *testing.T) {
-	for in, want := range map[string]uint64{"": 0, "ff": 255, "0xff": 255, "a1b2c3": 0xa1b2c3} {
-		got, err := parseCRC(in)
-		if err != nil || got != want {
-			t.Errorf("parseCRC(%q) = %d,%v want %d", in, got, err, want)
-		}
-	}
-	if _, err := parseCRC("zz"); err == nil {
-		t.Error("parseCRC(zz) should error")
-	}
-}
-
 func TestGrow(t *testing.T) {
 	const s = 1_000_000_000 // 1s in ns
 	cases := []struct{ cur, max, want int64 }{
