@@ -101,8 +101,16 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	//    up (retried until it succeeds).
 	if s.UpdateURL != "" {
 		if err := s.updateBeforeLaunch(ctx, bin); err != nil {
+			// Today this only ever reports cancellation, because the check is
+			// retried until it passes. Do not assume that: reporting an
+			// unexpected failure as a clean stop would hide it from the SCM,
+			// which then has no reason to restart the service.
+			if ctx.Err() == nil {
+				log.Error("update check gave up; service will exit", "err", err)
+				return err
+			}
 			log.Info("service stopping before first launch", "reason", err)
-			return nil // ctx cancelled while waiting for the network
+			return nil
 		}
 	} else {
 		log.Info("auto-update disabled; launching existing payload")
@@ -130,6 +138,13 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		log.Debug("waiting for an active user session")
 		sid, err := WaitForActiveConsole(ctx, 2*time.Second)
 		if err != nil {
+			if ctx.Err() == nil {
+				// Not a stop, so something is wrong with session lookup itself.
+				// Returning nil would report a clean stop and the SCM would
+				// leave the service down.
+				log.Error("cannot wait for a user session; service will exit", "err", err)
+				return fmt.Errorf("winsvr: waiting for a user session: %w", err)
+			}
 			log.Info("service stopping", "reason", err)
 			return nil
 		}

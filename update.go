@@ -34,6 +34,11 @@ const (
 	downloadAttempts  = 3
 )
 
+// staleTempAge is how old an abandoned download has to be before a sweep removes
+// it. Well above defaultTimeout, so a transfer still in flight is never taken out
+// from under itself.
+const staleTempAge = time.Hour
+
 // fileCRC64 returns the CRC-64/ECMA checksum of a file. An unreadable or absent
 // file is an error, never a checksum of zero, so a read failure cannot be
 // mistaken for a valid digest.
@@ -121,10 +126,37 @@ type payloadInfo struct {
 // returns whether a download happened. Every failure is returned rather than
 // worked around.
 func (u *Updater) EnsureLatest(ctx context.Context) (bool, error) {
+	u.sweepTemps()
 	if u.Sidecar {
 		return u.ensureSidecar(ctx)
 	}
 	return u.ensureETag(ctx)
+}
+
+// sweepTemps removes downloads abandoned beside the payload. Every error path in
+// a download cleans up after itself, but a process killed mid-transfer, by a
+// service stop or a power cut, cannot, and nothing else would ever remove what it
+// left. Only files older than staleTempAge go, so a concurrent download survives.
+func (u *Updater) sweepTemps() {
+	dir := filepath.Dir(u.Path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	prefix := filepath.Base(u.Path) + ".tmp-"
+	cutoff := time.Now().Add(-staleTempAge)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if rerr := os.Remove(filepath.Join(dir, e.Name())); rerr == nil && u.Logger != nil {
+			u.Logger.Info("update: removed an abandoned download", "path", e.Name())
+		}
+	}
 }
 
 // ensureETag keeps the payload in step with the ETag the server reports, which is

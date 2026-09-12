@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestUpdaterHEAD(t *testing.T) {
@@ -506,5 +507,54 @@ func TestUpdaterETagKeepsState(t *testing.T) {
 	}
 	if _, ok := raw["crc64"]; !ok {
 		t.Error("state must record the installed checksum, to notice a local change")
+	}
+}
+
+// A process killed mid-download cannot clean up after itself, and nothing else
+// used to remove what it left beside the payload.
+func TestUpdaterSweepsAbandonedDownloads(t *testing.T) {
+	const body = "payload-v1"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		if r.Method == http.MethodGet {
+			fmt.Fprint(w, body)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	u := &Updater{URL: srv.URL, Path: filepath.Join(dir, "helper.bin")}
+
+	stale := filepath.Join(dir, "helper.bin.tmp-999999")
+	fresh := filepath.Join(dir, "helper.bin.tmp-111111")
+	other := filepath.Join(dir, "unrelated.tmp-222222")
+	for _, p := range []string{stale, fresh, other} {
+		if err := os.WriteFile(p, []byte("partial"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Only the stale one is old enough to be swept.
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(other, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := u.EnsureLatest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); err == nil {
+		t.Error("an abandoned download older than the cutoff must be removed")
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Error("a recent temporary file may belong to a download in flight; it must be left alone")
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Error("a file that is not this payload's temporary must be left alone")
+	}
+	if got, _ := os.ReadFile(u.Path); string(got) != body {
+		t.Fatalf("payload = %q, want %q", got, body)
 	}
 }
