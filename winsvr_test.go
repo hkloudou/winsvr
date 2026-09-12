@@ -1,6 +1,9 @@
 package winsvr
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestServiceStateString(t *testing.T) {
 	cases := map[ServiceState]string{Running: "running", Stopped: "stopped", StartPending: "start-pending"}
@@ -20,5 +23,19 @@ func TestParseCRC(t *testing.T) {
 	}
 	if _, err := parseCRC("zz"); err == nil {
 		t.Error("parseCRC(zz) should error")
+	}
+}
+
+func TestGrow(t *testing.T) {
+	const s = 1_000_000_000 // 1s in ns
+	cases := []struct{ cur, max, want int64 }{
+		{2 * s, 30 * s, 4 * s},   // doubles
+		{20 * s, 30 * s, 30 * s}, // caps at max
+		{30 * s, 30 * s, 30 * s}, // stays at max
+	}
+	for _, c := range cases {
+		if got := int64(grow(time.Duration(c.cur), time.Duration(c.max))); got != c.want {
+			t.Errorf("grow(%d,%d)=%d want %d", c.cur, c.max, got, c.want)
+		}
 	}
 }

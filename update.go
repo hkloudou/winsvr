@@ -96,6 +96,11 @@ func (u *Updater) checkHTTP(ctx context.Context, cur updateState) (bool, updateS
 		return false, cur, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		// A bad URL or a server that rejects HEAD lands here; surface it clearly
+		// instead of misreading a missing ETag as "a newer payload".
+		return false, cur, fmt.Errorf("update: HEAD %s: %s", u.URL, resp.Status)
+	}
 	next := updateState{ETag: resp.Header.Get("ETag")}
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
 		next.Size, _ = strconv.ParseInt(cl, 10, 64)

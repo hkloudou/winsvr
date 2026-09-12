@@ -75,3 +75,18 @@ func TestUpdaterSidecarCRCMismatch(t *testing.T) {
 		t.Fatal("corrupt payload must not be installed")
 	}
 }
+
+func TestUpdaterHEADNon200(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusNotFound)
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	u := &Updater{URL: srv.URL, Path: filepath.Join(dir, "helper.bin")}
+	if _, err := u.EnsureLatest(context.Background()); err == nil {
+		t.Fatal("expected an error for a non-200 HEAD")
+	}
+	if _, err := os.Stat(u.Path); err == nil {
+		t.Fatal("nothing should be installed on a failed check")
+	}
+}

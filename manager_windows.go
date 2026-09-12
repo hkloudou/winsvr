@@ -64,6 +64,14 @@ func Install(c Config) error {
 		if err := s.SetRecoveryActions([]mgr.RecoveryAction{ra, ra, ra}, 86400); err != nil {
 			return fmt.Errorf("set recovery actions: %w", err)
 		}
+		// By default the SCM only runs recovery actions after a hard crash (the
+		// process dies without reporting SERVICE_STOPPED). Our service reports a
+		// clean STOPPED with a non-zero exit code when Run fails, so opt in to
+		// recovery on those non-crash failures too — otherwise RestartDelay
+		// would never fire for a normal error exit.
+		if err := s.SetRecoveryActionsOnNonCrashFailures(true); err != nil {
+			return fmt.Errorf("enable recovery on non-crash failures: %w", err)
+		}
 	}
 	if err := eventlog.InstallAsEventCreate(c.Name, eventlog.Error|eventlog.Warning|eventlog.Info); err != nil &&
 		!errors.Is(err, os.ErrExist) {

@@ -115,6 +115,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if max <= 0 {
 		max = 30 * time.Second
 	}
+	if max < min {
+		max = min
+	}
 	backoff := min
 	for ctx.Err() == nil {
 		log.Debug("waiting for an active user session")
@@ -134,13 +137,19 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			continue
 		}
 		log.Info("payload running", "pid", proc.PID, "session", sid)
-		backoff = min // a successful launch resets the restart backoff
 
+		started := time.Now()
 		code, werr := proc.Wait(ctx)
 		proc.Close() // terminates the payload process tree via the job object
 		if ctx.Err() != nil {
 			log.Info("service stopping; payload terminated", "pid", proc.PID)
 			return nil
+		}
+		// Reset the backoff only after the payload stayed up long enough to be
+		// considered healthy. A payload that starts but crashes immediately must
+		// keep backing off, or it would restart-storm at the minimum interval.
+		if time.Since(started) >= max {
+			backoff = min
 		}
 		if werr != nil {
 			log.Warn("payload wait error; will restart", "pid", proc.PID, "err", werr, "backoff", backoff.String())
@@ -173,6 +182,9 @@ func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
 				log.Info("payload already up to date")
 			}
 			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err() // the service is stopping, not an update failure
 		}
 		// Most commonly this is "no network yet"; keep waiting. Config errors
 		// (bad URL, 404) also land here and repeat in the log so they are easy
