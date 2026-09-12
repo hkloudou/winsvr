@@ -74,6 +74,9 @@ func Install(c Config) error {
 	// installed", so undo it instead.
 	fail := func(err error) error {
 		_ = s.Delete()
+		// InstallAsEventCreate writes a registry key before it can fail, so undo
+		// that too rather than leaving the source behind without a service.
+		_ = eventlog.Remove(c.Name)
 		return err
 	}
 
