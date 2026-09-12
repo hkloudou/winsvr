@@ -9,7 +9,9 @@
 
 GOWINRES ?= go-winres
 VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-ARCHES   ?= amd64,386
+# arm64 is included because CI cross-builds it: without a .syso for the arch,
+# an arm64 binary silently ships with no manifest and no version resource.
+ARCHES   ?= amd64,386,arm64
 
 CGO      ?= 0
 GOOS      = windows

@@ -44,16 +44,26 @@ func Install(c Config) error {
 	defer m.Disconnect()
 
 	s, err := m.CreateService(c.Name, exe, mgr.Config{
-		DisplayName:      c.displayName(),
-		Description:      c.Description,
-		StartType:        c.mgrStartType(),
+		DisplayName: c.displayName(),
+		Description: c.Description,
+		StartType:   c.mgrStartType(),
+		// Left at its zero value this is SERVICE_ERROR_IGNORE, under which the
+		// SCM records nothing when the service fails to start. Match what
+		// sc.exe does, so a failed start is visible in the event log.
+		ErrorControl:     mgr.ErrorNormal,
 		Dependencies:     c.Dependencies,
 		ServiceStartName: c.Account,
 		Password:         c.Password,
 	}, c.Arguments...)
 	if err != nil {
-		if errors.Is(err, windows.ERROR_SERVICE_EXISTS) {
+		switch {
+		case errors.Is(err, windows.ERROR_SERVICE_EXISTS):
 			return fmt.Errorf("service %q is already installed", c.Name)
+		case errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE):
+			// A previous uninstall deleted the service while it was still
+			// running, so the registration lingers until that process exits.
+			// Without this case the caller sees a bare error code.
+			return fmt.Errorf("service %q is still being removed; wait for its old process to exit, or reboot, then install again", c.Name)
 		}
 		return fmt.Errorf("create service: %w", err)
 	}
@@ -80,7 +90,13 @@ func Install(c Config) error {
 	return nil
 }
 
-// Uninstall stops and removes the service and its event-log source. Requires admin.
+// stopWait is how long Uninstall waits for a service to report Stopped before
+// deleting it anyway.
+const stopWait = 20 * time.Second
+
+// Uninstall stops and removes the service and its event-log source. Requires
+// admin. A service that will not stop within stopWait is still deleted, and the
+// returned error says that the removal completes when its process exits.
 func Uninstall(name string) error {
 	m, err := mgr.Connect()
 	if err != nil {
@@ -100,11 +116,17 @@ func Uninstall(name string) error {
 	// Supervisor terminate the payload (its job object is closed), so by the
 	// time this returns the old helper is gone and its file is unlocked — which
 	// is what makes a reinstall replace the helper cleanly.
-	if status, err := s.Control(svc.Stop); err == nil && status.State != svc.Stopped {
-		deadline := time.Now().Add(20 * time.Second)
+	stopped := true
+	if status, cerr := s.Control(svc.Stop); cerr == nil && status.State != svc.Stopped {
+		stopped = false
+		deadline := time.Now().Add(stopWait)
 		for time.Now().Before(deadline) {
 			st, qerr := s.Query()
-			if qerr != nil || st.State == svc.Stopped {
+			if qerr != nil {
+				break
+			}
+			if st.State == svc.Stopped {
+				stopped = true
 				break
 			}
 			time.Sleep(300 * time.Millisecond)
@@ -115,6 +137,13 @@ func Uninstall(name string) error {
 	}
 	if err := eventlog.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove event source: %w", err)
+	}
+	if !stopped {
+		// Delete was accepted, but a service that is still running stays
+		// registered as "marked for delete" until its process exits. Say so:
+		// Status keeps finding the service and a reinstall is refused until
+		// then, which otherwise looks like the uninstall simply did nothing.
+		return fmt.Errorf("service %q was removed but did not stop within %s; it disappears once its process exits, which a reboot guarantees", name, stopWait)
 	}
 	return nil
 }

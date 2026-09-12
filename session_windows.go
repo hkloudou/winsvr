@@ -16,25 +16,51 @@ import (
 // noSession is the sentinel returned when no user is signed in to the console.
 const noSession uint32 = 0xFFFFFFFF
 
-// ActiveConsoleSession returns the session id currently attached to the console
-// and whether a user is signed in there.
+// hasSignedInUser reports whether a user token can be obtained for a session.
+//
+// Only a caller holding SeTcbPrivilege, in practice LocalSystem, can ask at all.
+// One without it is told so through ERROR_PRIVILEGE_NOT_HELD and gets true, so
+// the session's own state still decides for it. Every other failure means nobody
+// is signed in: the exact code a signed-out session reports is not consistent
+// across Windows versions, and a service must not depend on telling them apart.
+func hasSignedInUser(sid uint32) bool {
+	var tok windows.Token
+	err := windows.WTSQueryUserToken(sid, &tok)
+	if err == nil {
+		tok.Close()
+		return true
+	}
+	return errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD)
+}
+
+// ActiveConsoleSession returns the session id of a signed-in user, preferring the
+// one attached to the physical console.
+//
+// A session is active with no user signed in whenever the machine sits at a logon
+// screen, and launching into one can only fail. So a session counts here only
+// once a user token exists for it; reporting it ready earlier is what made a
+// service retry, and log, for as long as nobody signed in.
 func ActiveConsoleSession() (uint32, bool) {
+	console := windows.WTSGetActiveConsoleSessionId()
+	if console != noSession && hasSignedInUser(console) {
+		return console, true
+	}
 	var p *windows.WTS_SESSION_INFO
 	var n uint32
 	if err := windows.WTSEnumerateSessions(0, 0, 1, &p, &n); err == nil {
 		defer windows.WTSFreeMemory(uintptr(unsafe.Pointer(p)))
 		for _, s := range unsafe.Slice(p, n) {
-			if s.State == windows.WTSActive {
+			if s.State == windows.WTSActive && s.SessionID != console && hasSignedInUser(s.SessionID) {
 				return s.SessionID, true
 			}
 		}
 	}
-	id := windows.WTSGetActiveConsoleSessionId()
-	return id, id != noSession
+	return noSession, false
 }
 
 // WaitForActiveConsole blocks until a user is signed in to the console session
-// or ctx is cancelled.
+// or ctx is cancelled. It polls, and logs nothing, so a machine left at a logon
+// screen simply waits.
 func WaitForActiveConsole(ctx context.Context, poll time.Duration) (uint32, error) {
 	if poll <= 0 {
 		poll = 2 * time.Second
@@ -72,7 +98,14 @@ type Process struct {
 func userToken(sessionID uint32, elevated bool) (windows.Token, error) {
 	var user windows.Token
 	if err := windows.WTSQueryUserToken(sessionID, &user); err != nil {
-		return 0, fmt.Errorf("WTSQueryUserToken(session %d): %w", sessionID, err)
+		if errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) {
+			// Not running as LocalSystem. That is a configuration mistake, not a
+			// session that is waiting for someone to sign in, so report it loudly.
+			return 0, fmt.Errorf("WTSQueryUserToken(session %d): the service must run as LocalSystem: %w", sessionID, err)
+		}
+		// Anything else means the session has no signed-in user right now, most
+		// often because they signed out between the session check and this call.
+		return 0, fmt.Errorf("%w: session %d: %w", ErrNoUserSession, sessionID, err)
 	}
 	defer user.Close()
 	src := user
@@ -189,11 +222,15 @@ func (p *Process) Wait(ctx context.Context) (uint32, error) {
 }
 
 // Close terminates the process (and its whole tree, via the job) and releases
-// the handles.
+// the handles. It is safe to call more than once: both handles are cleared, so a
+// second call cannot close a descriptor Windows has since handed to something
+// else.
 func (p *Process) Close() error {
-	windows.CloseHandle(p.handle)
-	if p.job != 0 {
-		j := p.job
+	if h := p.handle; h != 0 {
+		p.handle = 0
+		windows.CloseHandle(h)
+	}
+	if j := p.job; j != 0 {
 		p.job = 0
 		return windows.CloseHandle(j)
 	}

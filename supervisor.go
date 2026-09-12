@@ -2,8 +2,10 @@ package winsvr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -39,6 +41,11 @@ type Supervisor struct {
 	Hidden bool
 	// MinBackoff/MaxBackoff bound the exponential restart delay (default 2s/30s).
 	MinBackoff, MaxBackoff time.Duration
+	// HTTPClient overrides the client used for the update check and download.
+	// The default allows five minutes for one whole request, body included, and
+	// refuses a redirect that drops TLS. Supply your own for a large payload on
+	// a slow link, with no Timeout, so only the context bounds the transfer.
+	HTTPClient *http.Client
 	// Logger receives progress logs. Defaults to no-op; wire NewEventLogger for
 	// a service, or a stderr slog handler for interactive debugging.
 	Logger *slog.Logger
@@ -129,6 +136,16 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		log.Info("launching payload", "session", sid, "path", bin)
 		proc, err := LaunchInSession(sid, LaunchOptions{Path: bin, Elevated: s.Elevated, Hidden: s.Hidden})
 		if err != nil {
+			// A user who signed out between the session check and the launch is
+			// not a failure: wait again rather than logging an error and widening
+			// the backoff, which at a logon screen would repeat indefinitely.
+			if errors.Is(err, ErrNoUserSession) {
+				log.Info("no interactive user yet; waiting for sign-in", "session", sid)
+				if !sleep(ctx, min) {
+					return nil
+				}
+				continue
+			}
 			log.Error("launch failed; will retry", "err", err, "backoff", backoff.String())
 			if !sleep(ctx, backoff) {
 				return nil
@@ -148,7 +165,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		// Reset the backoff only after the payload stayed up long enough to be
 		// considered healthy. A payload that starts but crashes immediately must
 		// keep backing off, or it would restart-storm at the minimum interval.
-		if time.Since(started) >= max {
+		if time.Since(started) >= healthyAfter {
 			backoff = min
 		}
 		if werr != nil {
@@ -164,13 +181,15 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	return nil
 }
 
-// updateBeforeLaunch runs the update check and installs a newer payload, waiting
-// for the network by retrying until the check succeeds or ctx is cancelled.
+// updateBeforeLaunch runs the update check and installs a newer payload, retrying
+// until it succeeds or ctx is cancelled. That covers waiting for the network and
+// equally a server that cannot identify its payload, such as one sending no ETag:
+// the payload does not launch until the check passes.
 func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
 	log := s.log()
 	// Pass the logger so the Updater logs the ETag/version comparison and the
 	// resulting action ("update check ... needsUpdate=... action=...").
-	up := &Updater{URL: s.UpdateURL, Path: bin, Sidecar: s.Sidecar, Logger: log}
+	up := &Updater{URL: s.UpdateURL, Path: bin, Sidecar: s.Sidecar, Client: s.HTTPClient, Logger: log}
 
 	const maxWait = 60 * time.Second
 	wait := 2 * time.Second
@@ -183,10 +202,11 @@ func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
 		if ctx.Err() != nil {
 			return ctx.Err() // the service is stopping, not an update failure
 		}
-		// Most commonly this is "no network yet"; keep waiting. Config errors
-		// (bad URL, 404) also land here and repeat in the log so they are easy
-		// to spot while debugging.
-		log.Warn("update check failed; waiting for network", "attempt", attempt, "err", err, "retryIn", wait.String())
+		// Usually "no network yet", so keep waiting. A bad URL, a 404, a missing
+		// ETag and an incomplete sidecar land here too and repeat in the log
+		// rather than being worked around: the payload has to be identifiable
+		// before it runs. The error says which it is.
+		log.Warn("update check failed; will retry", "attempt", attempt, "err", err, "retryIn", wait.String())
 		if !sleep(ctx, wait) {
 			return ctx.Err()
 		}
@@ -194,6 +214,11 @@ func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
 	}
 	return ctx.Err()
 }
+
+// healthyAfter is how long the payload must stay up before the restart backoff
+// resets to MinBackoff. It is deliberately not MaxBackoff, which bounds the pause
+// between retries and says nothing about how long a run must last to count.
+const healthyAfter = 30 * time.Second
 
 func sleep(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
