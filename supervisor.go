@@ -168,20 +168,17 @@ func (s *Supervisor) Run(ctx context.Context) error {
 // for the network by retrying until the check succeeds or ctx is cancelled.
 func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
 	log := s.log()
-	up := &Updater{URL: s.UpdateURL, Path: bin, Sidecar: s.Sidecar}
+	// Pass the logger so the Updater logs the ETag/version comparison and the
+	// resulting action ("update check ... needsUpdate=... action=...").
+	up := &Updater{URL: s.UpdateURL, Path: bin, Sidecar: s.Sidecar, Logger: log}
 
 	const maxWait = 60 * time.Second
 	wait := 2 * time.Second
 	for attempt := 1; ctx.Err() == nil; attempt++ {
 		log.Debug("checking for payload update", "attempt", attempt, "url", s.UpdateURL)
-		updated, err := up.EnsureLatest(ctx)
+		_, err := up.EnsureLatest(ctx)
 		if err == nil {
-			if updated {
-				log.Info("payload updated to latest", "path", bin)
-			} else {
-				log.Info("payload already up to date")
-			}
-			return nil
+			return nil // the Updater already logged the comparison and action
 		}
 		if ctx.Err() != nil {
 			return ctx.Err() // the service is stopping, not an update failure

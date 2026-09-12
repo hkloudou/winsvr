@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc64"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -42,6 +43,11 @@ type Updater struct {
 	Path    string       // local file (required)
 	Sidecar bool         // use <URL>.json instead of HEAD/ETag
 	Client  *http.Client // defaults to a 30s client
+	// Logger, when set, receives one Info "update check" record per check with
+	// the remote and local validators (ETag, or version+crc64 in sidecar mode),
+	// whether an update was needed, and the action taken. Supervisor passes its
+	// own logger here.
+	Logger *slog.Logger
 }
 
 func (u *Updater) client() *http.Client {
@@ -76,14 +82,48 @@ func (u *Updater) EnsureLatest(ctx context.Context) (updated bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	if _, statErr := os.Stat(u.Path); !newer && statErr == nil {
+	_, statErr := os.Stat(u.Path)
+	missing := statErr != nil
+	if !newer && !missing {
+		u.logCheck(cur, next, newer, missing, "up-to-date")
 		return false, nil
 	}
 	if err := u.download(ctx, next); err != nil {
 		return false, err
 	}
 	u.saveState(next)
+	u.logCheck(cur, next, newer, missing, "downloaded")
 	return true, nil
+}
+
+// logCheck emits one Info record describing the comparison and the action, with
+// mode-appropriate fields (ETag for HTTP, version+crc64 for sidecar). No-op
+// when no Logger is set.
+func (u *Updater) logCheck(cur, next updateState, needsUpdate, missing bool, action string) {
+	if u.Logger == nil {
+		return
+	}
+	if u.Sidecar {
+		u.Logger.Info("update check",
+			"mode", "sidecar",
+			"path", u.Path,
+			"remote_version", next.Version,
+			"local_version", cur.Version,
+			"remote_crc64", fmt.Sprintf("%016x", next.CRC64),
+			"local_crc64", fmt.Sprintf("%016x", cur.CRC64),
+			"needsUpdate", needsUpdate,
+			"missing", missing,
+			"action", action)
+		return
+	}
+	u.Logger.Info("update check",
+		"mode", "http",
+		"path", u.Path,
+		"remote_etag", next.ETag,
+		"local_etag", cur.ETag,
+		"needsUpdate", needsUpdate,
+		"missing", missing,
+		"action", action)
 }
 
 func (u *Updater) checkHTTP(ctx context.Context, cur updateState) (bool, updateState, error) {

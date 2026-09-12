@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"hash/crc64"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -88,5 +90,31 @@ func TestUpdaterHEADNon200(t *testing.T) {
 	}
 	if _, err := os.Stat(u.Path); err == nil {
 		t.Fatal("nothing should be installed on a failed check")
+	}
+}
+
+func TestUpdaterLogsETagDecision(t *testing.T) {
+	etag := `"v9"`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", etag)
+		if r.Method == http.MethodGet {
+			fmt.Fprint(w, "body")
+		}
+	}))
+	defer srv.Close()
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	dir := t.TempDir()
+	u := &Updater{URL: srv.URL, Path: filepath.Join(dir, "helper.bin"), Logger: logger}
+
+	if _, err := u.EnsureLatest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	for _, want := range []string{"update check", "remote_etag", "local_etag", "needsUpdate=", "action=downloaded"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log missing %q; got: %s", want, out)
+		}
 	}
 }
