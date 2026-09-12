@@ -71,12 +71,11 @@ func Install(c Config) error {
 
 	// The service exists from here on. A later failure would otherwise leave it
 	// half-installed, and the retry that follows would be refused as "already
-	// installed", so undo it instead.
+	// installed", so undo it instead. Only the service: the event source may
+	// predate this install, which InstallAsEventCreate explicitly allows, and is
+	// then not ours to remove.
 	fail := func(err error) error {
 		_ = s.Delete()
-		// InstallAsEventCreate writes a registry key before it can fail, so undo
-		// that too rather than leaving the source behind without a service.
-		_ = eventlog.Remove(c.Name)
 		return err
 	}
 
@@ -96,6 +95,9 @@ func Install(c Config) error {
 	}
 	if err := eventlog.InstallAsEventCreate(c.Name, eventlog.Error|eventlog.Warning|eventlog.Info); err != nil &&
 		!errors.Is(err, os.ErrExist) {
+		// This call writes its key before it can fail, so clear what it left.
+		// Only here: on the paths above the source was never touched.
+		_ = eventlog.Remove(c.Name)
 		return fail(fmt.Errorf("install event source: %w", err))
 	}
 	return nil
@@ -106,8 +108,9 @@ func Install(c Config) error {
 const stopWait = 20 * time.Second
 
 // Uninstall stops and removes the service and its event-log source. Requires
-// admin. A service that will not stop within stopWait is still deleted, and the
-// returned error says that the removal completes when its process exits.
+// admin. The removal happens even when the service cannot be stopped, whether it
+// ran out of stopWait or refused the request outright; the returned error then
+// says so, and that the removal completes when the service's process exits.
 func Uninstall(name string) error {
 	m, err := mgr.Connect()
 	if err != nil {
@@ -122,26 +125,28 @@ func Uninstall(name string) error {
 		return err
 	}
 	defer s.Close()
-	// Stop the service and wait for it to actually reach Stopped before
-	// deleting. Stopping cancels the service's context, which makes the
-	// Supervisor terminate the payload (its job object is closed), so by the
-	// time this returns the old helper is gone and its file is unlocked — which
-	// is what makes a reinstall replace the helper cleanly.
-	stopped, err := stopAndWait(s, name)
-	if err != nil {
-		return err
-	}
+	// Stop first and wait for it to actually reach Stopped. Stopping cancels the
+	// service's context, which makes the Supervisor terminate the payload (its
+	// job object closes), so by the time this returns the old helper is gone and
+	// its file unlocked — which is what lets a reinstall replace it cleanly.
+	//
+	// A stop that fails does not abort the removal, because removal is what this
+	// function promises: dependent services, for one, make the stop impossible
+	// while leaving the deletion perfectly possible. It is reported afterwards.
+	stopped, stopErr := stopAndWait(s, name)
 	if err := s.Delete(); err != nil {
 		return fmt.Errorf("delete service: %w", err)
 	}
 	if err := eventlog.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove event source: %w", err)
 	}
-	if !stopped {
-		// Delete was accepted, but a service that is still running stays
-		// registered as "marked for delete" until its process exits. Say so:
-		// Status keeps finding the service and a reinstall is refused until
-		// then, which otherwise looks like the uninstall simply did nothing.
+	// Delete only marks a running service for removal; it stays registered, and
+	// a reinstall stays refused, until its process exits. Saying so is what
+	// keeps that from looking like an uninstall that did nothing.
+	switch {
+	case stopErr != nil:
+		return fmt.Errorf("service %q was removed, but stopping it first failed, so it may still be running: %w", name, stopErr)
+	case !stopped:
 		return fmt.Errorf("service %q was removed but did not stop within %s; it disappears once its process exits, which a reboot guarantees", name, stopWait)
 	}
 	return nil

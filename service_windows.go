@@ -4,6 +4,7 @@ package winsvr
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -79,7 +80,11 @@ func (h *handler) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 				// silence is the thing Logged exists to prevent.
 				select {
 				case err := <-done:
-					if err != nil {
+					// A Service that waits on ctx.Done and returns ctx.Err is
+					// doing exactly what Service documents, so that is a clean
+					// stop, not a failure. Logging it would put an error in the
+					// event log on every routine stop and every shutdown.
+					if err != nil && !errors.Is(err, context.Canceled) {
 						h.log().Error("service stopped on request, but Run returned an error", "err", err)
 					}
 				case <-time.After(h.stopTimeout):

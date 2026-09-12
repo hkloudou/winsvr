@@ -589,15 +589,22 @@ func TestInstallRemovesThePayloadBeforeItKnowsTheRenameWorks(t *testing.T) {
 func TestSweepOnlyMatchesGeneratedTempNames(t *testing.T) {
 	const prefix = "helper.bin.tmp-"
 	for name, want := range map[string]bool{
-		"helper.bin.tmp-123456":  true,
-		"helper.bin.tmp-0":       true,
-		"helper.bin.tmp-backup":  false,
-		"helper.bin.tmp-":        false,
-		"helper.bin.tmp-12a":     false,
-		"helper.bin.tmp-12.old":  false,
-		"helper.bin":             false,
-		"helper.bin.update.json": false,
-		"otherpayload.tmp-123":   false,
+		"helper.bin.tmp-123456":         true,
+		"helper.bin.tmp-0":              true,
+		"helper.bin.tmp-4294967295":     true,  // the largest uint32
+		"helper.bin.tmp-4294967296":     false, // one past it
+		"helper.bin.tmp-20260912123456": false, // a timestamp-shaped backup
+		"helper.bin.tmp-007":            false, // leading zeroes
+		"helper.bin.tmp-backup":         false,
+		"helper.bin.tmp-":               false,
+		"helper.bin.tmp-12a":            false,
+		"helper.bin.tmp-12.old":         false,
+		"helper.bin.tmp--1":             false,
+		"helper.bin.tmp-+1":             false,
+		"helper.bin.tmp- 12":            false,
+		"helper.bin":                    false,
+		"helper.bin.update.json":        false,
+		"otherpayload.tmp-123":          false,
 	} {
 		if got := isGeneratedTemp(name, prefix); got != want {
 			t.Errorf("isGeneratedTemp(%q) = %v, want %v", name, got, want)

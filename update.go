@@ -141,20 +141,17 @@ func (u *Updater) EnsureLatest(ctx context.Context) (bool, error) {
 }
 
 // isGeneratedTemp reports whether name is one os.CreateTemp could have produced
-// for this payload. It appends only decimal digits to the pattern it is given, so
-// insisting on those keeps the sweep away from a file someone created by hand as,
-// say, "helper.bin.tmp-backup".
+// for this payload. It fills the pattern's "*" with a uint32 in canonical decimal,
+// so anything else is somebody's own file and not ours to delete: not just
+// "helper.bin.tmp-backup", but a timestamp like "helper.bin.tmp-20260912123456",
+// which is too large, and "helper.bin.tmp-007", which has leading zeroes.
 func isGeneratedTemp(name, prefix string) bool {
 	suffix, ok := strings.CutPrefix(name, prefix)
-	if !ok || suffix == "" {
+	if !ok {
 		return false
 	}
-	for _, r := range suffix {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
+	n, err := strconv.ParseUint(suffix, 10, 32)
+	return err == nil && strconv.FormatUint(n, 10) == suffix
 }
 
 // sweepTemps removes downloads abandoned beside the payload. Every error path in
