@@ -34,7 +34,6 @@ const (
 
 	helperBin = "helper.bin" // payload file name, next to this executable
 	updateURL = ""           // e.g. "https://dl.example.com/helper.bin"; "" disables auto-update
-	sidecar   = false        // true: check <updateURL>.json (version+crc64) instead of HEAD/ETag
 )
 
 var config = winsvr.Config{
@@ -51,7 +50,6 @@ func supervisor() *winsvr.Supervisor {
 	return &winsvr.Supervisor{
 		Bin:       helperBin,
 		UpdateURL: updateURL,
-		Sidecar:   sidecar,
 		Hidden:    true, // no console window for the payload
 	}
 }

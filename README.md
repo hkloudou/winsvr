@@ -8,8 +8,8 @@ in the logged-on user's desktop session.
   `golang.org/x/sys/windows/svc`.
 - Launch a program **as the interactive user** from a `LocalSystem` service,
   wrapped in a kill-on-close Job Object so it can't outlive the service.
-- **Self-updating**: one cheap `HEAD` check at boot (or a `version`+`crc64`
-  sidecar), verified install, crash-restart.
+- **Self-updating**: one cheap `HEAD` check at boot, verified install,
+  crash-restart.
 - Builds on every OS — non-Windows gets stubs, so your logic stays testable on
   Linux/macOS CI.
 
@@ -130,37 +130,22 @@ payload is launched. The sequence guarantees the payload that runs is current:
    service start.
 
 Crash-restarts of the payload reuse the current binary; a fresh check happens
-only the next time the service itself starts. Pick the strategy with one field:
-
-```go
-&winsvr.Supervisor{Bin: "helper.bin", UpdateURL: url}                 // HEAD: ETag, required
-&winsvr.Supervisor{Bin: "helper.bin", UpdateURL: url, Sidecar: true}  // GET url+".json": {version, size, crc64}
-```
-
-The sidecar (`helper.bin.json`, e.g.
-`{"version":"1.4.0","size":12345,"crc64":"a1b2…"}`) adds semantic versions and an
-end-to-end CRC-64/ECMA integrity check.
+only the next time the service itself starts.
 
 #### The payload must be identifiable
 
-Neither mode guesses. If the server cannot say which payload it is serving, the
-check fails, it is retried, and **the payload does not launch** until the server
-is fixed. The log says which of the two it is.
+The check does not guess. **An `ETag` header is required**, on the `HEAD` and on
+the `GET`: it is the only validator there is. Comparing `Content-Length` instead
+would compare a number a rebuild can leave unchanged, so a missing `ETag` is
+reported as the server misconfiguration it is. The check then fails, is retried,
+and **the payload does not launch** until the server is fixed.
 
-- **ETag mode requires an `ETag` header**, on the `HEAD` and on the `GET`. It is
-  the only validator this mode has. Comparing `Content-Length` instead would
-  compare a number a rebuild can leave unchanged, so a missing `ETag` is
-  reported as the server misconfiguration it is rather than worked around.
-  On nginx, `ETag` is on by default for static files; S3 and most CDNs send one.
-- **Sidecar mode requires `crc64`.** It is both what the mode compares and what
-  it verifies, so a sidecar without one identifies nothing. Reading it as
-  "nothing to verify" would let a server switch checking off by dropping a
-  field.
+On nginx, `ETag` is on by default for static files; S3 and most CDNs send one.
 
 #### Where the state lives
 
-ETag mode writes `helper.bin.update.json` next to the payload, holding the ETag
-it last installed and that payload's checksum.
+`helper.bin.update.json` sits next to the payload, holding the ETag last
+installed and that payload's checksum.
 
 The ETag is the reason the file exists. HTTP defines it as an **opaque**
 validator, so it cannot be assumed to follow from the payload's content. Some
@@ -171,13 +156,8 @@ a digest of the part digests rather than of the file. Redeploying identical byte
 changes the first two. So the value the server sent has to be stored, because it
 cannot be recomputed.
 
-If you control the server and can publish a content hash, that is what sidecar
-mode is, and it needs no state file.
-
-Sidecar mode keeps **no state at all**. The sidecar already publishes the
-payload's checksum, so comparing that with the file on disk answers both
-questions at once, whether a new release exists and whether the payload is still
-the one that was installed. A leftover state file from ETag mode is deleted.
+The checksum is this library's own, taken from the bytes it installed. It is what
+notices a payload corrupted or replaced on disk while the remote stayed put.
 
 For a large payload on a slow link, `HTTPClient` replaces the default client,
 which allows five minutes for one whole request, body included. Supply your own
@@ -188,12 +168,12 @@ with no `Timeout` and let the service's context bound the transfer instead.
 Read this before pointing `UpdateURL` at anything. The check defends against a
 stale or corrupted payload. It does not defend against an attacker.
 
-- **CRC-64 is not a signature.** It catches accidental corruption. It is not a
-  cryptographic hash, and it is linear, so producing content that matches a
-  given checksum is easy. The sidecar also travels over the same connection as
-  the payload, so whoever can rewrite one can rewrite the other. For
-  authenticity, verify a real signature over the downloaded file against a
-  public key compiled into the service, before it is installed.
+- **Nothing here authenticates the payload.** The ETag says the remote changed;
+  it does not say who changed it. The checksum finds corruption on disk, not
+  tampering: CRC-64 is not a cryptographic hash, and it is linear, so producing
+  content that matches a given value is easy. For authenticity, verify a real
+  signature over the downloaded file against a public key compiled into the
+  service, before it is installed.
 - **Use HTTPS.** Nothing here rejects an `http://` URL. The default client does
   refuse a redirect that drops TLS, so an `https://` URL cannot be steered onto
   plain HTTP, but that only helps if you started with `https://`.
