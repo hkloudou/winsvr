@@ -9,7 +9,7 @@ in the logged-on user's desktop session.
 - Launch a program **as the interactive user** from a `LocalSystem` service,
   wrapped in a kill-on-close Job Object so it can't outlive the service.
 - **Self-updating**: one cheap `HEAD` check at boot (or a `version`+`crc64`
-  sidecar), atomic swap, crash-restart.
+  sidecar), verified install, crash-restart.
 - Builds on every OS — non-Windows gets stubs, so your logic stays testable on
   Linux/macOS CI.
 
@@ -112,8 +112,14 @@ payload is launched. The sequence guarantees the payload that runs is current:
 1. **Wait for the network.** The check is retried until it succeeds, so a
    machine that boots offline does not run a possibly-stale payload; it waits
    for connectivity first. Retries and errors are logged.
-2. `HEAD` the URL; if the payload is newer (or missing), `GET`, verify, atomic
-   swap — done while the payload is stopped, so replacing the file is safe.
+2. `HEAD` the URL; if the payload is newer, missing, or no longer matches the
+   checksum recorded when it was installed, `GET` it, verify size and checksum,
+   then swap it in. The swap removes the old file and renames the new one into
+   place, retrying for a moment, so a scanner holding a transient lock cannot
+   leave the machine with no payload at all. It runs while the payload is
+   stopped, so the file is not in use. The validator is recorded from the `GET`
+   rather than the `HEAD`: if a release lands between the two, the body is read
+   again, so what gets stored always describes the bytes on disk.
 3. Launch the now-current payload in the user's session.
 4. Supervise it (restart on crash). **No further update checks** until the next
    service start.
@@ -126,8 +132,40 @@ only the next time the service itself starts. Pick the strategy with one field:
 &winsvr.Supervisor{Bin: "helper.bin", UpdateURL: url, Sidecar: true}  // GET url+".json": {version, crc64}
 ```
 
-The sidecar (`helper.bin.json`, e.g. `{"version":"1.4.0","crc64":"a1b2…"}`) adds
-semantic versions and an end-to-end CRC-64/ECMA integrity check.
+The sidecar (`helper.bin.json`, e.g.
+`{"version":"1.4.0","size":12345,"crc64":"a1b2…"}`) adds semantic versions and an
+end-to-end CRC-64/ECMA integrity check. `crc64` is required in this mode: a
+sidecar without one is rejected rather than read as "nothing to verify", so a
+server cannot switch checking off by dropping a field.
+
+Two more fields matter for a large payload. `HTTPClient` replaces the default
+client, which allows five minutes for one whole request, body included; supply
+your own with no `Timeout` when a slow link needs longer and let the service's
+context bound the transfer instead. `MaxUpdateBytes` moves the size cap.
+
+### What auto-update does not protect you from
+
+Read this before pointing `UpdateURL` at anything. The check defends against a
+stale or corrupted payload. It does not defend against an attacker.
+
+- **CRC-64 is not a signature.** It catches accidental corruption. It is not a
+  cryptographic hash, and it is linear, so producing content that matches a
+  given checksum is easy. The sidecar also travels over the same connection as
+  the payload, so whoever can rewrite one can rewrite the other. For
+  authenticity, verify a real signature over the downloaded file against a
+  public key compiled into the service, before it is installed.
+- **Use HTTPS.** Nothing here rejects an `http://` URL. The default client does
+  refuse a redirect that drops TLS, so an `https://` URL cannot be steered onto
+  plain HTTP, but that only helps if you started with `https://`.
+- **The install directory is the real trust boundary.** The payload sits beside
+  the service exe, and the service runs as `LocalSystem`. Any user who can write
+  that directory can replace either binary, and replacing the service exe means
+  SYSTEM at the next boot. Install under `%ProgramFiles%`, or anywhere else only
+  administrators can write. Never install from a download folder.
+- **`Elevated` is not a privilege boundary.** It launches the payload with the
+  signed-in user's linked admin token, inside that user's own session, where
+  they can debug it or inject into it. It also needs that user to be an
+  administrator: a standard user has no linked token, and the launch fails.
 
 ### Using the primitives directly
 

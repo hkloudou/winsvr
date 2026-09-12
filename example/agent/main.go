@@ -96,7 +96,11 @@ func dispatch(cmd string) error {
 		if err := winsvr.Install(config); err != nil {
 			return err
 		}
-		_ = winsvr.Start(config.Name)
+		if err := winsvr.Start(config.Name); err != nil {
+			// The service is registered but not running, so do not claim it
+			// started. A wrong account or a bad path shows up here.
+			return fmt.Errorf("%s installed but did not start: %w", config.Name, err)
+		}
 		report("服务已安装并启动 / service installed and started: " + config.Name)
 		return nil
 

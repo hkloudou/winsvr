@@ -22,6 +22,12 @@ import (
 // ErrUnsupported is returned by Windows-only calls on other platforms.
 var ErrUnsupported = errors.New("winsvr: only supported on windows")
 
+// ErrNoUserSession reports that no user is signed in to the target session, so
+// there is nothing to launch into. A logon screen and a signed-out machine both
+// look like this. It is a normal waiting condition rather than a failure, so
+// callers should wait for a sign-in instead of retrying harder.
+var ErrNoUserSession = errors.New("winsvr: no user signed in to the session")
+
 // Logged is an optional interface a Service may implement so winsvr.Run can log
 // framework-level events to the service's own logger — most importantly, the
 // error returned when Run exits unexpectedly, which would otherwise be silent.
