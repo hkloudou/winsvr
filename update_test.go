@@ -558,3 +558,49 @@ func TestUpdaterSweepsAbandonedDownloads(t *testing.T) {
 		t.Fatalf("payload = %q, want %q", got, body)
 	}
 }
+
+// install removes the existing payload before renaming the download over it, which
+// is deliberate. This pins what that costs, so the behaviour cannot drift
+// unnoticed: when the rename cannot be made, the old payload is gone too, and no
+// state is recorded, so the next check downloads again.
+//
+// The other failed-install test cannot reach this window, because its fixture is a
+// non-empty directory on which the remove itself fails.
+func TestInstallRemovesThePayloadBeforeItKnowsTheRenameWorks(t *testing.T) {
+	dir := t.TempDir()
+	u := &Updater{URL: "http://example.invalid/helper.bin", Path: filepath.Join(dir, "helper.bin")}
+	if err := os.WriteFile(u.Path, []byte("the old payload"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A download that is not there can never be renamed into place.
+	if err := u.install(context.Background(), filepath.Join(dir, "helper.bin.tmp-404")); err == nil {
+		t.Fatal("install with no downloaded file must report an error")
+	}
+	if _, err := os.Stat(u.Path); err == nil {
+		t.Fatal("the payload survived: the remove-first window is gone, so update install's doc comment")
+	}
+	if _, err := os.Stat(u.statePath()); err == nil {
+		t.Error("no state may be recorded for an install that did not happen")
+	}
+}
+
+// The sweep must only touch names os.CreateTemp could have produced, so a file
+// someone put there by hand is left alone.
+func TestSweepOnlyMatchesGeneratedTempNames(t *testing.T) {
+	const prefix = "helper.bin.tmp-"
+	for name, want := range map[string]bool{
+		"helper.bin.tmp-123456":  true,
+		"helper.bin.tmp-0":       true,
+		"helper.bin.tmp-backup":  false,
+		"helper.bin.tmp-":        false,
+		"helper.bin.tmp-12a":     false,
+		"helper.bin.tmp-12.old":  false,
+		"helper.bin":             false,
+		"helper.bin.update.json": false,
+		"otherpayload.tmp-123":   false,
+	} {
+		if got := isGeneratedTemp(name, prefix); got != want {
+			t.Errorf("isGeneratedTemp(%q) = %v, want %v", name, got, want)
+		}
+	}
+}

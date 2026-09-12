@@ -4,6 +4,7 @@ package winsvr
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"golang.org/x/sys/windows/svc"
@@ -33,6 +34,15 @@ type handler struct {
 	stopTimeout time.Duration
 }
 
+// log returns the service's own logger when it offers one, so framework-level
+// events land wherever the rest of its output goes, and a no-op otherwise.
+func (h *handler) log() *slog.Logger {
+	if lg, ok := h.svc.(Logged); ok {
+		return lg.ServiceLogger()
+	}
+	return slog.New(discardHandler{})
+}
+
 func (h *handler) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- svc.Status) (bool, uint32) {
 	const accepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPreShutdown
 	s <- svc.Status{State: svc.StartPending, WaitHint: 15_000}
@@ -46,15 +56,13 @@ func (h *handler) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 	for {
 		select {
 		case err := <-done:
-			// The service's Run returned on its own (not via a stop request).
-			// A nil error is a clean exit; a non-nil error must not be silent —
-			// log it (when the Service exposes a logger) and report a failure
-			// exit code so the SCM records it and any recovery action fires.
+			// The service's Run returned on its own, not via a stop request. A
+			// nil error is a clean exit; a non-nil one must not pass in silence,
+			// so log it and report a failure exit code, which is what makes the
+			// SCM record it and any recovery action fire.
 			s <- svc.Status{State: svc.StopPending}
 			if err != nil {
-				if lg, ok := h.svc.(Logged); ok {
-					lg.ServiceLogger().Error("service stopped: Run returned an error", "err", err)
-				}
+				h.log().Error("service stopped: Run returned an error", "err", err)
 				return true, 1
 			}
 			return false, 0
@@ -65,9 +73,18 @@ func (h *handler) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 			case svc.Stop, svc.Shutdown, svc.PreShutdown:
 				s <- svc.Status{State: svc.StopPending, WaitHint: uint32(h.stopTimeout / time.Millisecond)}
 				cancel()
+				// Report a clean stop either way: a non-zero code here would have
+				// the SCM's recovery action restart a service someone deliberately
+				// stopped. But say what happened, because a failure passing in
+				// silence is the thing Logged exists to prevent.
 				select {
-				case <-done:
+				case err := <-done:
+					if err != nil {
+						h.log().Error("service stopped on request, but Run returned an error", "err", err)
+					}
 				case <-time.After(h.stopTimeout):
+					h.log().Warn("Run did not return within the stop timeout; exiting anyway",
+						"timeout", h.stopTimeout.String())
 				}
 				return false, 0
 			}

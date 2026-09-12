@@ -69,10 +69,18 @@ func Install(c Config) error {
 	}
 	defer s.Close()
 
+	// The service exists from here on. A later failure would otherwise leave it
+	// half-installed, and the retry that follows would be refused as "already
+	// installed", so undo it instead.
+	fail := func(err error) error {
+		_ = s.Delete()
+		return err
+	}
+
 	if c.RestartDelay > 0 {
 		ra := mgr.RecoveryAction{Type: mgr.ServiceRestart, Delay: c.RestartDelay}
 		if err := s.SetRecoveryActions([]mgr.RecoveryAction{ra, ra, ra}, 86400); err != nil {
-			return fmt.Errorf("set recovery actions: %w", err)
+			return fail(fmt.Errorf("set recovery actions: %w", err))
 		}
 		// By default the SCM only runs recovery actions after a hard crash (the
 		// process dies without reporting SERVICE_STOPPED). Our service reports a
@@ -80,12 +88,12 @@ func Install(c Config) error {
 		// recovery on those non-crash failures too — otherwise RestartDelay
 		// would never fire for a normal error exit.
 		if err := s.SetRecoveryActionsOnNonCrashFailures(true); err != nil {
-			return fmt.Errorf("enable recovery on non-crash failures: %w", err)
+			return fail(fmt.Errorf("enable recovery on non-crash failures: %w", err))
 		}
 	}
 	if err := eventlog.InstallAsEventCreate(c.Name, eventlog.Error|eventlog.Warning|eventlog.Info); err != nil &&
 		!errors.Is(err, os.ErrExist) {
-		return fmt.Errorf("install event source: %w", err)
+		return fail(fmt.Errorf("install event source: %w", err))
 	}
 	return nil
 }
@@ -116,21 +124,9 @@ func Uninstall(name string) error {
 	// Supervisor terminate the payload (its job object is closed), so by the
 	// time this returns the old helper is gone and its file is unlocked — which
 	// is what makes a reinstall replace the helper cleanly.
-	stopped := true
-	if status, cerr := s.Control(svc.Stop); cerr == nil && status.State != svc.Stopped {
-		stopped = false
-		deadline := time.Now().Add(stopWait)
-		for time.Now().Before(deadline) {
-			st, qerr := s.Query()
-			if qerr != nil {
-				break
-			}
-			if st.State == svc.Stopped {
-				stopped = true
-				break
-			}
-			time.Sleep(300 * time.Millisecond)
-		}
+	stopped, err := stopAndWait(s, name)
+	if err != nil {
+		return err
 	}
 	if err := s.Delete(); err != nil {
 		return fmt.Errorf("delete service: %w", err)
@@ -146,6 +142,42 @@ func Uninstall(name string) error {
 		return fmt.Errorf("service %q was removed but did not stop within %s; it disappears once its process exits, which a reboot guarantees", name, stopWait)
 	}
 	return nil
+}
+
+// stopAndWait asks the service to stop and waits up to stopWait for it to get
+// there, asking again while it is in a state that cannot accept the request yet.
+// It reports whether the service actually reached Stopped.
+//
+// Control returns the service's most recent status alongside some errors, so the
+// status has to be read even when the call failed. A service still starting
+// refuses the control with ERROR_SERVICE_CANNOT_ACCEPT_CTRL while reporting
+// StartPending; reading that as "already stopped" would delete a service that is
+// still running, and its payload with it, while reporting success. That is also
+// why the request is repeated: a service that never accepted a stop will finish
+// starting and then sit there Running, with nothing having asked it to stop.
+func stopAndWait(s *mgr.Service, name string) (bool, error) {
+	deadline := time.Now().Add(stopWait)
+	for {
+		status, cerr := s.Control(svc.Stop)
+		switch {
+		case errors.Is(cerr, windows.ERROR_SERVICE_NOT_ACTIVE):
+			return true, nil
+		case cerr == nil,
+			errors.Is(cerr, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL),
+			errors.Is(cerr, windows.ERROR_INVALID_SERVICE_CONTROL):
+			// Accepted, or refused because the service is mid-transition. Either
+			// way status carries what it last reported.
+			if status.State == svc.Stopped {
+				return true, nil
+			}
+		default:
+			return false, fmt.Errorf("stop service %q: %w", name, cerr)
+		}
+		if !time.Now().Before(deadline) {
+			return false, nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
 }
 
 // Status reports the current state of the named service. It needs only
@@ -263,7 +295,9 @@ func Elevate(ctx context.Context, args []string) (uint32, error) {
 		}
 		if ev == windows.WAIT_OBJECT_0 {
 			var code uint32
-			windows.GetExitCodeProcess(info.Process, &code)
+			if err := windows.GetExitCodeProcess(info.Process, &code); err != nil {
+				return 0, fmt.Errorf("GetExitCodeProcess: %w", err)
+			}
 			return code, nil
 		}
 		select {

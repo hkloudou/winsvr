@@ -37,6 +37,13 @@ const (
 // staleTempAge is how old an abandoned download has to be before a sweep removes
 // it. Well above defaultTimeout, so a transfer still in flight is never taken out
 // from under itself.
+//
+// The age is a heuristic rather than proof that nothing owns the file, and it does
+// not need to be more than that: Go opens files on Windows without
+// FILE_SHARE_DELETE, so a download another process still holds open cannot be
+// removed at all, and one Updater per payload path is an invariant of Supervisor.
+// A sweep that somehow lost a race would cost one retried download, never the
+// payload itself.
 const staleTempAge = time.Hour
 
 // fileCRC64 returns the CRC-64/ECMA checksum of a file. An unreadable or absent
@@ -133,6 +140,23 @@ func (u *Updater) EnsureLatest(ctx context.Context) (bool, error) {
 	return u.ensureETag(ctx)
 }
 
+// isGeneratedTemp reports whether name is one os.CreateTemp could have produced
+// for this payload. It appends only decimal digits to the pattern it is given, so
+// insisting on those keeps the sweep away from a file someone created by hand as,
+// say, "helper.bin.tmp-backup".
+func isGeneratedTemp(name, prefix string) bool {
+	suffix, ok := strings.CutPrefix(name, prefix)
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // sweepTemps removes downloads abandoned beside the payload. Every error path in
 // a download cleans up after itself, but a process killed mid-transfer, by a
 // service stop or a power cut, cannot, and nothing else would ever remove what it
@@ -146,7 +170,7 @@ func (u *Updater) sweepTemps() {
 	prefix := filepath.Base(u.Path) + ".tmp-"
 	cutoff := time.Now().Add(-staleTempAge)
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
+		if e.IsDir() || !isGeneratedTemp(e.Name(), prefix) {
 			continue
 		}
 		info, ierr := e.Info()
@@ -403,10 +427,15 @@ func (u *Updater) fetch(ctx context.Context, want payloadInfo) (string, payloadI
 	return tmpName, payloadInfo{ETag: etag, CRC64: sum}, nil
 }
 
-// install puts the downloaded file in place. The existing payload is removed
-// first so the rename cannot be refused over a destination already there, then
-// the rename is retried briefly: giving up on the first transient lock would
-// leave no payload at all.
+// install puts the downloaded file in place.
+//
+// The existing payload is removed first, deliberately, so the rename cannot be
+// refused over a destination that is already there. Be clear about what that
+// costs: between the remove and a successful rename there is no payload, and if
+// every attempt fails there is none afterwards either. The retries ride out the
+// common case, a scanner holding the new file for a moment. Recovery comes from
+// the state file, which is written only on success, so the next service start
+// downloads again.
 func (u *Updater) install(ctx context.Context, tmpName string) error {
 	_ = os.Remove(u.Path)
 	var err error
