@@ -109,34 +109,65 @@ The payload is updated **only when the service starts** — once per boot for an
 auto-start service, and again on every SCM restart — and always **before** the
 payload is launched. The sequence guarantees the payload that runs is current:
 
-1. **Wait for the network.** The check is retried until it succeeds, so a
+1. **Wait until the check passes.** It is retried until it succeeds, so a
    machine that boots offline does not run a possibly-stale payload; it waits
-   for connectivity first. Retries and errors are logged.
-2. `HEAD` the URL; if the payload is newer, missing, or no longer matches the
-   checksum recorded when it was installed, `GET` it, verify size and checksum,
-   then swap it in. The swap removes the old file and renames the new one into
-   place, retrying for a moment, so a scanner holding a transient lock cannot
-   leave the machine with no payload at all. It runs while the payload is
-   stopped, so the file is not in use. The validator is recorded from the `GET`
+   for connectivity first. A server that cannot identify its payload holds
+   things up the same way, on purpose: see **the payload must be
+   identifiable** below. Retries and errors are logged.
+2. **Compare.** Ask the server what the current payload is, and download when it
+   differs from the one on disk, when there is none, or when the payload no
+   longer matches the checksum it is supposed to have. That last case is what
+   catches a payload corrupted or replaced locally while the remote stayed put.
+3. **Verify, then swap.** Check the size and the checksum before anything is
+   installed. The swap removes the old file and renames the new one into place,
+   retrying for a moment, so a scanner holding a transient lock cannot leave the
+   machine with no payload at all. It runs while the payload is stopped, so the
+   file is not in use. In ETag mode the validator is recorded from the `GET`
    rather than the `HEAD`: if a release lands between the two, the body is read
    again, so what gets stored always describes the bytes on disk.
-3. Launch the now-current payload in the user's session.
-4. Supervise it (restart on crash). **No further update checks** until the next
+4. Launch the now-current payload in the user's session.
+5. Supervise it (restart on crash). **No further update checks** until the next
    service start.
 
 Crash-restarts of the payload reuse the current binary; a fresh check happens
 only the next time the service itself starts. Pick the strategy with one field:
 
 ```go
-&winsvr.Supervisor{Bin: "helper.bin", UpdateURL: url}                 // HEAD: ETag / Content-Length
-&winsvr.Supervisor{Bin: "helper.bin", UpdateURL: url, Sidecar: true}  // GET url+".json": {version, crc64}
+&winsvr.Supervisor{Bin: "helper.bin", UpdateURL: url}                 // HEAD: ETag, required
+&winsvr.Supervisor{Bin: "helper.bin", UpdateURL: url, Sidecar: true}  // GET url+".json": {version, size, crc64}
 ```
 
 The sidecar (`helper.bin.json`, e.g.
 `{"version":"1.4.0","size":12345,"crc64":"a1b2…"}`) adds semantic versions and an
-end-to-end CRC-64/ECMA integrity check. `crc64` is required in this mode: a
-sidecar without one is rejected rather than read as "nothing to verify", so a
-server cannot switch checking off by dropping a field.
+end-to-end CRC-64/ECMA integrity check.
+
+#### The payload must be identifiable
+
+Neither mode guesses. If the server cannot say which payload it is serving, the
+check fails, it is retried, and **the payload does not launch** until the server
+is fixed. The log says which of the two it is.
+
+- **ETag mode requires an `ETag` header**, on the `HEAD` and on the `GET`. It is
+  the only validator this mode has. Comparing `Content-Length` instead would
+  compare a number a rebuild can leave unchanged, so a missing `ETag` is
+  reported as the server misconfiguration it is rather than worked around.
+  On nginx, `ETag` is on by default for static files; S3 and most CDNs send one.
+- **Sidecar mode requires `crc64`.** It is both what the mode compares and what
+  it verifies, so a sidecar without one identifies nothing. Reading it as
+  "nothing to verify" would let a server switch checking off by dropping a
+  field.
+
+#### Where the state lives
+
+ETag mode writes `helper.bin.update.json` next to the payload, holding the ETag
+it last installed and that payload's checksum. The ETag is the reason the file
+exists: unlike a checksum it cannot be recomputed from the bytes on disk, so it
+has to survive a restart.
+
+Sidecar mode keeps **no state at all**. The sidecar already publishes the
+payload's checksum, so comparing that with the file on disk answers both
+questions at once, whether a new release exists and whether the payload is still
+the one that was installed. A leftover state file from ETag mode is deleted.
 
 Two more fields matter for a large payload. `HTTPClient` replaces the default
 client, which allows five minutes for one whole request, body included; supply

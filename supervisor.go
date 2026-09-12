@@ -194,8 +194,10 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	return nil
 }
 
-// updateBeforeLaunch runs the update check and installs a newer payload, waiting
-// for the network by retrying until the check succeeds or ctx is cancelled.
+// updateBeforeLaunch runs the update check and installs a newer payload,
+// retrying until the check succeeds or ctx is cancelled. That covers waiting for
+// the network and equally a server that cannot identify its payload, such as one
+// sending no ETag: the payload does not launch until the check passes.
 func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
 	log := s.log()
 	// Pass the logger so the Updater logs the ETag/version comparison and the
@@ -220,10 +222,11 @@ func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
 		if ctx.Err() != nil {
 			return ctx.Err() // the service is stopping, not an update failure
 		}
-		// Most commonly this is "no network yet"; keep waiting. Config errors
-		// (bad URL, 404) also land here and repeat in the log so they are easy
-		// to spot while debugging.
-		log.Warn("update check failed; waiting for network", "attempt", attempt, "err", err, "retryIn", wait.String())
+		// Most commonly this is "no network yet", so keep waiting. A bad URL, a
+		// 404, a missing ETag and an incomplete sidecar all land here too, and
+		// repeat in the log rather than being worked around: the payload is
+		// required to be identifiable before it runs. The error says which it is.
+		log.Warn("update check failed; will retry", "attempt", attempt, "err", err, "retryIn", wait.String())
 		if !sleep(ctx, wait) {
 			return ctx.Err()
 		}

@@ -2,6 +2,7 @@ package winsvr
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"hash/crc64"
 	"log/slog"
@@ -349,5 +350,161 @@ func TestUpdaterFailedInstallLeavesNoState(t *testing.T) {
 		if strings.Contains(e.Name(), ".tmp-") {
 			t.Errorf("leftover temporary file %s", e.Name())
 		}
+	}
+}
+
+// The default mode has nothing but the ETag to compare, so a server that does
+// not send one is reported rather than worked around.
+func TestUpdaterRequiresETag(t *testing.T) {
+	t.Run("missing on HEAD", func(t *testing.T) {
+		var gets atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				gets.Add(1)
+				fmt.Fprint(w, "payload")
+			}
+		}))
+		defer srv.Close()
+
+		dir := t.TempDir()
+		u := &Updater{URL: srv.URL, Path: filepath.Join(dir, "helper.bin")}
+		if _, err := u.EnsureLatest(context.Background()); err == nil {
+			t.Fatal("a HEAD with no ETag must be an error, not a fallback comparison")
+		}
+		if got := gets.Load(); got != 0 {
+			t.Errorf("GET count = %d, want 0: nothing should be downloaded", got)
+		}
+		if _, err := os.Stat(u.Path); err == nil {
+			t.Error("nothing should be installed")
+		}
+	})
+
+	t.Run("missing on GET", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodHead {
+				w.Header().Set("ETag", `"v1"`)
+				return
+			}
+			fmt.Fprint(w, "payload") // no ETag on the body
+		}))
+		defer srv.Close()
+
+		dir := t.TempDir()
+		u := &Updater{URL: srv.URL, Path: filepath.Join(dir, "helper.bin")}
+		if _, err := u.EnsureLatest(context.Background()); err == nil {
+			t.Fatal("a GET with no ETag must be an error: it is what gets recorded")
+		}
+		if _, err := os.Stat(u.Path); err == nil {
+			t.Error("nothing should be installed")
+		}
+	})
+
+	// Sidecar mode identifies the payload by its published checksum, so it needs
+	// no ETag at all.
+	t.Run("not required in sidecar mode", func(t *testing.T) {
+		const body = "payload"
+		crc := crc64.Checksum([]byte(body), crc64.MakeTable(crc64.ECMA))
+		mux := http.NewServeMux()
+		mux.HandleFunc("/helper.bin", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, body) })
+		mux.HandleFunc("/helper.bin.json", func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, `{"version":"1.0.0","size":%d,"crc64":"%x"}`, len(body), crc)
+		})
+		srv := httptest.NewServer(mux)
+		defer srv.Close()
+
+		dir := t.TempDir()
+		u := &Updater{URL: srv.URL + "/helper.bin", Path: filepath.Join(dir, "helper.bin"), Sidecar: true}
+		if updated, err := u.EnsureLatest(context.Background()); err != nil || !updated {
+			t.Fatalf("EnsureLatest = %v,%v", updated, err)
+		}
+	})
+}
+
+// Sidecar mode compares the published checksum against the file on disk, so the
+// state file ETag mode needs is redundant there: none is written, and a leftover
+// one is cleaned up.
+func TestUpdaterSidecarKeepsNoState(t *testing.T) {
+	const body = "payload-v1"
+	crc := crc64.Checksum([]byte(body), crc64.MakeTable(crc64.ECMA))
+	var gets atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/helper.bin", func(w http.ResponseWriter, r *http.Request) {
+		gets.Add(1)
+		fmt.Fprint(w, body)
+	})
+	mux.HandleFunc("/helper.bin.json", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"version":"1.2.3","size":%d,"crc64":"%x"}`, len(body), crc)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	u := &Updater{URL: srv.URL + "/helper.bin", Path: filepath.Join(dir, "helper.bin"), Sidecar: true}
+	// Leave behind the state file ETag mode would have written.
+	if err := os.WriteFile(u.statePath(), []byte(`{"etag":"\"stale\""}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if updated, err := u.EnsureLatest(context.Background()); err != nil || !updated {
+		t.Fatalf("EnsureLatest = %v,%v", updated, err)
+	}
+	if _, err := os.Stat(u.statePath()); err == nil {
+		t.Error("sidecar mode must not leave a state file behind")
+	}
+
+	// With no state at all the second check is still a no-op: the comparison
+	// comes from the payload itself.
+	if updated, err := u.EnsureLatest(context.Background()); err != nil || updated {
+		t.Fatalf("second EnsureLatest = %v,%v (want false)", updated, err)
+	}
+	if got := gets.Load(); got != 1 {
+		t.Errorf("payload GET count = %d, want 1", got)
+	}
+
+	// The same comparison catches a payload changed on disk.
+	if err := os.WriteFile(u.Path, []byte("malicious"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if updated, err := u.EnsureLatest(context.Background()); err != nil || !updated {
+		t.Fatalf("EnsureLatest after tampering = %v,%v, want a re-download", updated, err)
+	}
+	if got, _ := os.ReadFile(u.Path); string(got) != body {
+		t.Fatalf("payload = %q, want the published copy restored", got)
+	}
+}
+
+// ETag mode cannot recompute the remote validator from the file, so it does keep
+// a state file, holding only what cannot be derived.
+func TestUpdaterETagKeepsState(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		if r.Method == http.MethodGet {
+			fmt.Fprint(w, "payload-v1")
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	u := &Updater{URL: srv.URL, Path: filepath.Join(dir, "helper.bin")}
+	if _, err := u.EnsureLatest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(u.statePath())
+	if err != nil {
+		t.Fatalf("etag mode must record the remote validator: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, gone := range []string{"version", "size"} {
+		if _, ok := raw[gone]; ok {
+			t.Errorf("state still carries %q, which is derivable or unused", gone)
+		}
+	}
+	if raw["etag"] != `"v1"` {
+		t.Errorf("state etag = %v, want the served one", raw["etag"])
+	}
+	if _, ok := raw["crc64"]; !ok {
+		t.Error("state must record the installed checksum, to notice a local change")
 	}
 }

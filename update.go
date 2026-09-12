@@ -29,16 +29,17 @@ const defaultTimeout = 5 * time.Minute
 
 // installAttempts is how many times an install retries the final rename, and
 // installRetryDelay is the pause between tries. A scanner or the search indexer
-// can hold a freshly written file open for a moment.
+// can hold a freshly written file open for a moment. downloadAttempts bounds how
+// many times a release changing mid-read is read again.
 const (
 	installAttempts   = 5
 	installRetryDelay = 200 * time.Millisecond
 	downloadAttempts  = 3
 )
 
-// fileCRC64 returns the CRC-64/ECMA checksum of a file. An unreadable file is
-// an error, never a checksum of zero, so a read failure cannot be mistaken for
-// a valid digest.
+// fileCRC64 returns the CRC-64/ECMA checksum of a file. An unreadable or absent
+// file is an error, never a checksum of zero, so a read failure cannot be
+// mistaken for a valid digest.
 func fileCRC64(path string) (uint64, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -52,13 +53,14 @@ func fileCRC64(path string) (uint64, error) {
 	return h.Sum64(), nil
 }
 
-// Updater keeps one local file in sync with a remote URL. This library checks
-// it once, at service start (see Supervisor). Two modes:
+// Updater keeps one local file in sync with a remote URL. This library checks it
+// once, at service start (see Supervisor). Two modes:
 //
-//   - default: an HTTP HEAD compares ETag, then Content-Length. Works with any
-//     static host (nginx, S3, a CDN) with no server changes.
-//   - Sidecar: GET <URL>.json {"version","size","crc64"} (crc64 as hex) to compare a version
-//     and verify a CRC-64/ECMA checksum end-to-end after download.
+//   - default: an HTTP HEAD compares the ETag. The server must send one; see
+//     EnsureLatest. Works with any static host (nginx, S3, a CDN) that is
+//     configured to do so, with no other server changes.
+//   - Sidecar: GET <URL>.json {"version","size","crc64"} (crc64 as hex), which
+//     publishes the payload's checksum so it can be verified end to end.
 //
 // Note that CRC-64 detects accidental corruption, not tampering: it is not a
 // cryptographic hash, and the sidecar travels over the same connection as the
@@ -106,52 +108,71 @@ func (u *Updater) maxBytes() int64 {
 	return DefaultMaxBytes
 }
 
-func (u *Updater) statePath() string { return u.Path + ".update.json" }
-
-type updateState struct {
-	ETag    string `json:"etag,omitempty"`
-	Size    int64  `json:"size,omitempty"`
-	Version string `json:"version,omitempty"`
-	CRC64   uint64 `json:"crc64,omitempty"`
+// remote is what the server says about the payload right now. Only part of it is
+// worth keeping across a restart; see updateState.
+type remote struct {
+	ETag    string // ETag mode: required, the only validator there is
+	Version string // sidecar mode: informational, for the log
+	Size    int64  // sidecar mode: declared size, checked after download
+	CRC64   uint64 // sidecar mode: required, verified after download
 }
 
-// EnsureLatest checks the remote source and, if it is newer (or the local file
-// is missing or no longer matches the checksum recorded for it), downloads,
-// verifies, and installs it. It returns whether a download happened. A network
-// error is returned so the caller can decide whether to proceed with the
-// existing file.
-func (u *Updater) EnsureLatest(ctx context.Context) (updated bool, err error) {
-	cur := u.loadState()
-	var newer bool
-	var next updateState
+// statePath is where ETag mode records what it installed. Sidecar mode writes
+// nothing; see ensureSidecar.
+func (u *Updater) statePath() string { return u.Path + ".update.json" }
+
+// updateState is the little that has to survive a restart. Only the ETag truly
+// does: unlike a checksum it cannot be recomputed from the payload on disk. The
+// checksum rides along so ETag mode can still notice a payload that changed
+// locally while the remote stayed put.
+type updateState struct {
+	ETag  string `json:"etag,omitempty"`
+	CRC64 uint64 `json:"crc64,omitempty"`
+}
+
+// EnsureLatest checks the remote source and, if it is newer or the local payload
+// no longer matches what was installed, downloads, verifies, and installs it. It
+// returns whether a download happened.
+//
+// Every failure is returned rather than worked around, including a server that
+// sends no ETag in the default mode and a sidecar with no crc64. Both are
+// misconfigurations that leave no way to tell a new release from the payload
+// already on disk, so they are reported and the caller waits, rather than
+// guessing from a weaker signal. Supervisor retries until the check succeeds.
+func (u *Updater) EnsureLatest(ctx context.Context) (bool, error) {
 	if u.Sidecar {
-		newer, next, err = u.checkSidecar(ctx, cur)
-	} else {
-		newer, next, err = u.checkHTTP(ctx, cur)
+		return u.ensureSidecar(ctx)
 	}
+	return u.ensureETag(ctx)
+}
+
+// ensureETag keeps the payload in step with the ETag the server reports, which
+// is the only thing it can compare, so the recorded one has to persist.
+func (u *Updater) ensureETag(ctx context.Context) (bool, error) {
+	cur := u.loadState()
+	rem, err := u.head(ctx)
 	if err != nil {
 		return false, err
 	}
-	_, statErr := os.Stat(u.Path)
-	missing := statErr != nil
+	newer := rem.ETag != cur.ETag
 
-	// The recorded checksum describes the bytes that were installed, so
-	// re-verify the file itself. Without this a payload that was corrupted or
-	// replaced on disk after install is trusted forever, because the remote
-	// validator still matches the state file.
-	corrupt := false
-	if !missing && cur.CRC64 != 0 {
-		got, cerr := fileCRC64(u.Path)
-		if cerr != nil || got != cur.CRC64 {
-			corrupt = true
-		}
+	// The checksum recorded at install time is the only way to notice a payload
+	// that was corrupted or replaced on disk while the remote stayed put. A state
+	// file written before checksums were recorded has none, which reads as a
+	// mismatch and costs one re-download before it is back in step.
+	var localCRC uint64
+	var haveLocal bool
+	if !newer {
+		localCRC, err = fileCRC64(u.Path)
+		haveLocal = err == nil
 	}
+	changed := !newer && (!haveLocal || localCRC != cur.CRC64)
 
-	if !newer && !missing && !corrupt {
-		u.logCheck(cur, next, newer, missing, corrupt, "up-to-date")
+	if !newer && !changed {
+		u.logETag(cur, rem, newer, changed, "up-to-date")
 		return false, nil
 	}
-	installed, err := u.download(ctx, next)
+	installed, err := u.download(ctx, rem)
 	if err != nil {
 		return false, err
 	}
@@ -159,79 +180,110 @@ func (u *Updater) EnsureLatest(ctx context.Context) (updated bool, err error) {
 		u.Logger.Warn("update: could not record state; the next start will download again",
 			"path", u.statePath(), "err", serr)
 	}
-	u.logCheck(cur, installed, newer, missing, corrupt, "downloaded")
+	u.logETag(cur, rem, newer, changed, "downloaded")
 	return true, nil
 }
 
-// logCheck emits one Info record describing the comparison and the action, with
-// mode-appropriate fields (ETag for HTTP, version+crc64 for sidecar). No-op
-// when no Logger is set.
-func (u *Updater) logCheck(cur, next updateState, needsUpdate, missing, corrupt bool, action string) {
+// ensureSidecar keeps the payload in step with <URL>.json, holding no state at
+// all. The sidecar publishes the payload's own checksum, so comparing that with
+// the file on disk answers both questions at once: whether a new release exists,
+// and whether the payload is still the one that was installed.
+func (u *Updater) ensureSidecar(ctx context.Context) (bool, error) {
+	rem, err := u.sidecar(ctx)
+	if err != nil {
+		return false, err
+	}
+	localCRC, lerr := fileCRC64(u.Path)
+	haveLocal := lerr == nil
+	if haveLocal && localCRC == rem.CRC64 {
+		u.logSidecar(rem, localCRC, haveLocal, "up-to-date")
+		return false, nil
+	}
+	if _, err := u.download(ctx, rem); err != nil {
+		return false, err
+	}
+	// Nothing reads a state file in this mode. Drop one left by ETag mode so it
+	// cannot be mistaken for something that still matters.
+	_ = os.Remove(u.statePath())
+	u.logSidecar(rem, localCRC, haveLocal, "downloaded")
+	return true, nil
+}
+
+func crcField(v uint64, have bool) string {
+	if !have {
+		return "absent"
+	}
+	return fmt.Sprintf("%016x", v)
+}
+
+func (u *Updater) logETag(cur updateState, rem remote, newer, changed bool, action string) {
 	if u.Logger == nil {
 		return
 	}
-	if u.Sidecar {
-		u.Logger.Info("update check",
-			"mode", "sidecar",
-			"path", u.Path,
-			"remote_version", next.Version,
-			"local_version", cur.Version,
-			"remote_crc64", fmt.Sprintf("%016x", next.CRC64),
-			"local_crc64", fmt.Sprintf("%016x", cur.CRC64),
-			"needsUpdate", needsUpdate,
-			"missing", missing,
-			"corrupt", corrupt,
-			"action", action)
-		return
-	}
 	u.Logger.Info("update check",
-		"mode", "http",
+		"mode", "etag",
 		"path", u.Path,
-		"remote_etag", next.ETag,
+		"remote_etag", rem.ETag,
 		"local_etag", cur.ETag,
-		"needsUpdate", needsUpdate,
-		"missing", missing,
-		"corrupt", corrupt,
+		"needsUpdate", newer,
+		"locallyChanged", changed,
 		"action", action)
 }
 
-func (u *Updater) checkHTTP(ctx context.Context, cur updateState) (bool, updateState, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, u.URL, nil)
-	if err != nil {
-		return false, cur, err
+func (u *Updater) logSidecar(rem remote, localCRC uint64, haveLocal bool, action string) {
+	if u.Logger == nil {
+		return
 	}
-	resp, err := u.client().Do(req)
-	if err != nil {
-		return false, cur, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		// A bad URL or a server that rejects HEAD lands here; surface it clearly
-		// instead of misreading a missing ETag as "a newer payload".
-		return false, cur, fmt.Errorf("update: HEAD %s: %s", u.URL, resp.Status)
-	}
-	next := updateState{ETag: resp.Header.Get("ETag")}
-	if cl := resp.Header.Get("Content-Length"); cl != "" {
-		next.Size, _ = strconv.ParseInt(cl, 10, 64)
-	}
-	if next.ETag != "" || cur.ETag != "" {
-		return next.ETag != cur.ETag, next, nil
-	}
-	return next.Size != cur.Size, next, nil
+	u.Logger.Info("update check",
+		"mode", "sidecar",
+		"path", u.Path,
+		"remote_version", rem.Version,
+		"remote_crc64", fmt.Sprintf("%016x", rem.CRC64),
+		"local_crc64", crcField(localCRC, haveLocal),
+		"needsUpdate", !haveLocal || localCRC != rem.CRC64,
+		"action", action)
 }
 
-func (u *Updater) checkSidecar(ctx context.Context, cur updateState) (bool, updateState, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.URL+".json", nil)
+// head asks the server what the current payload is.
+//
+// An ETag is required. It is the only validator this mode has, and without one
+// there is no way to tell a new release from the payload already installed.
+// Falling back to Content-Length would compare a number that a recompression or
+// a rebuild can leave unchanged, so a missing ETag is reported as the server
+// misconfiguration it is.
+func (u *Updater) head(ctx context.Context) (remote, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, u.URL, nil)
 	if err != nil {
-		return false, cur, err
+		return remote{}, err
 	}
 	resp, err := u.client().Do(req)
 	if err != nil {
-		return false, cur, err
+		return remote{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false, cur, fmt.Errorf("update: sidecar %s.json: %s", u.URL, resp.Status)
+		// A bad URL or a server that rejects HEAD lands here.
+		return remote{}, fmt.Errorf("update: HEAD %s: %s", u.URL, resp.Status)
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		return remote{}, fmt.Errorf("update: HEAD %s: no ETag header, so the payload cannot be identified; configure the server to send one, or use sidecar mode", u.URL)
+	}
+	return remote{ETag: etag}, nil
+}
+
+func (u *Updater) sidecar(ctx context.Context) (remote, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.URL+".json", nil)
+	if err != nil {
+		return remote{}, err
+	}
+	resp, err := u.client().Do(req)
+	if err != nil {
+		return remote{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return remote{}, fmt.Errorf("update: sidecar %s.json: %s", u.URL, resp.Status)
 	}
 	var sc struct {
 		Version string `json:"version"`
@@ -239,45 +291,41 @@ func (u *Updater) checkSidecar(ctx context.Context, cur updateState) (bool, upda
 		CRC64   string `json:"crc64"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&sc); err != nil {
-		return false, cur, fmt.Errorf("update: decode sidecar: %w", err)
+		return remote{}, fmt.Errorf("update: decode sidecar: %w", err)
 	}
 	crc, err := parseCRC(sc.CRC64)
 	if err != nil {
-		return false, cur, fmt.Errorf("update: sidecar crc64 %q: %w", sc.CRC64, err)
+		return remote{}, fmt.Errorf("update: sidecar crc64 %q: %w", sc.CRC64, err)
 	}
 	if crc == 0 {
-		// Fail closed. The sidecar exists to carry an integrity check, so a
-		// missing crc64 is a broken sidecar. Treating it as "no verification
-		// needed" would let a server silently turn checking off.
-		return false, cur, fmt.Errorf("update: sidecar %s.json has no crc64 field", u.URL)
+		// Fail closed. The checksum is what this mode compares and what it
+		// verifies, so a sidecar without one identifies nothing. Reading it as
+		// "no verification needed" would let a server switch checking off.
+		return remote{}, fmt.Errorf("update: sidecar %s.json has no crc64 field", u.URL)
 	}
-	next := updateState{Version: sc.Version, Size: sc.Size, CRC64: crc}
-	if sc.Version != "" || cur.Version != "" {
-		return sc.Version != cur.Version, next, nil
-	}
-	return crc != cur.CRC64, next, nil
+	return remote{Version: sc.Version, Size: sc.Size, CRC64: crc}, nil
 }
 
 // download fetches the payload, verifies it, and installs it at u.Path. It
-// returns the state describing what actually landed on disk.
+// returns the state describing what landed on disk.
 //
-// The validator is recorded from the GET, not from the earlier HEAD. A release
-// that lands between the two would otherwise store the old ETag against the new
-// bytes, and the next genuine update would then be read as "up-to-date". When
-// the two disagree the content changed under us, so the body is read again.
-func (u *Updater) download(ctx context.Context, want updateState) (updateState, error) {
+// In ETag mode the validator is recorded from the GET, not the earlier HEAD. A
+// release landing between the two would otherwise store the old ETag against the
+// new bytes, and the next genuine update would then read as up-to-date. When the
+// two disagree the content changed under us, so the body is read again.
+func (u *Updater) download(ctx context.Context, want remote) (updateState, error) {
 	for attempt := 1; attempt <= downloadAttempts; attempt++ {
 		tmpName, got, err := u.fetch(ctx, want)
 		if err != nil {
 			return updateState{}, err
 		}
-		if !u.Sidecar && want.ETag != "" && got.ETag != "" && got.ETag != want.ETag {
+		if !u.Sidecar && got.ETag != want.ETag {
 			_ = os.Remove(tmpName)
 			if u.Logger != nil {
 				u.Logger.Warn("update: remote changed between HEAD and GET; reading again",
 					"attempt", attempt, "head_etag", want.ETag, "get_etag", got.ETag)
 			}
-			want = got
+			want.ETag = got.ETag
 			continue
 		}
 		if err := u.install(ctx, tmpName); err != nil {
@@ -290,9 +338,9 @@ func (u *Updater) download(ctx context.Context, want updateState) (updateState, 
 }
 
 // fetch downloads the payload into a temporary file beside u.Path and returns
-// that file's name with the validators the server reported for the bytes it
-// served. The caller installs or discards the temporary file.
-func (u *Updater) fetch(ctx context.Context, want updateState) (string, updateState, error) {
+// that file's name with the state describing the bytes it holds. The caller
+// installs or discards the temporary file.
+func (u *Updater) fetch(ctx context.Context, want remote) (string, updateState, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.URL, nil)
 	if err != nil {
 		return "", updateState{}, err
@@ -305,6 +353,12 @@ func (u *Updater) fetch(ctx context.Context, want updateState) (string, updateSt
 	if resp.StatusCode != http.StatusOK {
 		return "", updateState{}, fmt.Errorf("update: GET %s: %s", u.URL, resp.Status)
 	}
+	etag := resp.Header.Get("ETag")
+	if !u.Sidecar && etag == "" {
+		// Checked before reading the body, so a misconfigured server costs no
+		// bandwidth. The GET's own ETag is what gets recorded, so it has to exist.
+		return "", updateState{}, fmt.Errorf("update: GET %s: no ETag header, so the download cannot be identified; configure the server to send one, or use sidecar mode", u.URL)
+	}
 	limit := u.maxBytes()
 	if resp.ContentLength > limit {
 		return "", updateState{}, fmt.Errorf("update: %s declares %d bytes, over the %d byte limit", u.URL, resp.ContentLength, limit)
@@ -314,8 +368,8 @@ func (u *Updater) fetch(ctx context.Context, want updateState) (string, updateSt
 		return "", updateState{}, err
 	}
 	tmpName := tmp.Name()
-	// Read one byte past the limit, so an oversized body is reported rather
-	// than silently truncated into a corrupt payload.
+	// Read one byte past the limit, so an oversized body is reported rather than
+	// silently truncated into a corrupt payload.
 	n, err := io.Copy(tmp, io.LimitReader(resp.Body, limit+1))
 	if err == nil && n > limit {
 		err = fmt.Errorf("update: %s is larger than the %d byte limit", u.URL, limit)
@@ -323,6 +377,9 @@ func (u *Updater) fetch(ctx context.Context, want updateState) (string, updateSt
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
+	// Only the sidecar declares a size worth enforcing: it describes the payload
+	// itself. A Content-Length does not, because transfer encoding can make the
+	// bytes on the wire differ from the bytes written here.
 	if err == nil && want.Size > 0 && n != want.Size {
 		err = fmt.Errorf("update: size mismatch: got %d want %d", n, want.Size)
 	}
@@ -331,7 +388,6 @@ func (u *Updater) fetch(ctx context.Context, want updateState) (string, updateSt
 		return "", updateState{}, err
 	}
 
-	got := updateState{ETag: resp.Header.Get("ETag"), Size: n, Version: want.Version}
 	sum, err := fileCRC64(tmpName)
 	if err != nil {
 		_ = os.Remove(tmpName)
@@ -341,10 +397,9 @@ func (u *Updater) fetch(ctx context.Context, want updateState) (string, updateSt
 		_ = os.Remove(tmpName)
 		return "", updateState{}, fmt.Errorf("update: crc64 mismatch: got %016x want %016x", sum, want.CRC64)
 	}
-	// Record the checksum in both modes. HTTP mode publishes none, but storing
-	// what we installed is what lets EnsureLatest notice a later local change.
-	got.CRC64 = sum
-	return tmpName, got, nil
+	// Recorded in both modes. ETag mode publishes no checksum, but storing the
+	// one we installed is what lets a later local change be noticed.
+	return tmpName, updateState{ETag: etag, CRC64: sum}, nil
 }
 
 // install puts the downloaded file in place. The existing payload is removed
