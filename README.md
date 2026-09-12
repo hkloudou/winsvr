@@ -179,10 +179,9 @@ payload's checksum, so comparing that with the file on disk answers both
 questions at once, whether a new release exists and whether the payload is still
 the one that was installed. A leftover state file from ETag mode is deleted.
 
-Two more fields matter for a large payload. `HTTPClient` replaces the default
-client, which allows five minutes for one whole request, body included; supply
-your own with no `Timeout` when a slow link needs longer and let the service's
-context bound the transfer instead. `MaxUpdateBytes` moves the size cap.
+For a large payload on a slow link, `HTTPClient` replaces the default client,
+which allows five minutes for one whole request, body included. Supply your own
+with no `Timeout` and let the service's context bound the transfer instead.
 
 ### What auto-update does not protect you from
 

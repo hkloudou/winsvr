@@ -32,21 +32,15 @@ const (
 )
 
 type eventLogHandler struct {
-	log    *eventlog.Log
-	attrs  []slog.Attr
-	groups []string
+	log   *eventlog.Log
+	attrs []slog.Attr
+	// prefix is the open groups, already joined as "a.b.". Keys are qualified
+	// when they arrive, so attributes added before a group was opened do not pick
+	// up its prefix later.
+	prefix string
 }
 
 func (h *eventLogHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= slog.LevelInfo }
-
-// qualify prefixes a key with the open groups, so a key "k" inside group "g"
-// becomes "g.k".
-func (h *eventLogHandler) qualify(key string) string {
-	if len(h.groups) == 0 {
-		return key
-	}
-	return strings.Join(h.groups, ".") + "." + key
-}
 
 func (h *eventLogHandler) WithAttrs(as []slog.Attr) slog.Handler {
 	if len(as) == 0 {
@@ -54,10 +48,8 @@ func (h *eventLogHandler) WithAttrs(as []slog.Attr) slog.Handler {
 	}
 	n := *h
 	n.attrs = append([]slog.Attr{}, h.attrs...)
-	// Resolve each key against the groups open right now. Attributes added
-	// before a group was opened must not pick up its prefix later.
 	for _, a := range as {
-		a.Key = h.qualify(a.Key)
+		a.Key = h.prefix + a.Key
 		n.attrs = append(n.attrs, a)
 	}
 	return &n
@@ -70,7 +62,7 @@ func (h *eventLogHandler) WithGroup(name string) slog.Handler {
 		return h
 	}
 	n := *h
-	n.groups = append(append([]string{}, h.groups...), name)
+	n.prefix = h.prefix + name + "."
 	return &n
 }
 
@@ -80,7 +72,7 @@ func (h *eventLogHandler) Handle(_ context.Context, r slog.Record) error {
 	for _, a := range h.attrs {
 		fmt.Fprintf(&b, " %s=%v", a.Key, a.Value)
 	}
-	r.Attrs(func(a slog.Attr) bool { fmt.Fprintf(&b, " %s=%v", h.qualify(a.Key), a.Value); return true })
+	r.Attrs(func(a slog.Attr) bool { fmt.Fprintf(&b, " %s%s=%v", h.prefix, a.Key, a.Value); return true })
 	switch msg := b.String(); {
 	case r.Level >= slog.LevelError:
 		return h.log.Error(eidError, msg)

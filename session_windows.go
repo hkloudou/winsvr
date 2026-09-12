@@ -16,80 +16,43 @@ import (
 // noSession is the sentinel returned when no user is signed in to the console.
 const noSession uint32 = 0xFFFFFFFF
 
-// tokenState is what could be learned about a session's user token.
-type tokenState int
-
-const (
-	tokenAbsent  tokenState = iota // no user is signed in to the session
-	tokenPresent                   // a user is signed in
-	tokenUnknown                   // the caller lacks the privilege to tell
-)
-
-// sessionToken reports whether a user token can be obtained for a session.
+// hasSignedInUser reports whether a user token can be obtained for a session.
 //
-// Only a caller holding SeTcbPrivilege, in practice LocalSystem, can ask this at
-// all; one without it is told so through ERROR_PRIVILEGE_NOT_HELD and gets
-// tokenUnknown instead of a confidently wrong answer. Every other failure is
-// read as "no user signed in", because the exact code a signed-out session
-// reports is not consistent across Windows versions and a service must not
-// depend on telling 1008 from 5.
-func sessionToken(sid uint32) tokenState {
+// Only a caller holding SeTcbPrivilege, in practice LocalSystem, can ask at all.
+// One without it is told so through ERROR_PRIVILEGE_NOT_HELD and gets true, so
+// the session's own state still decides for it. Every other failure means nobody
+// is signed in: the exact code a signed-out session reports is not consistent
+// across Windows versions, and a service must not depend on telling them apart.
+func hasSignedInUser(sid uint32) bool {
 	var tok windows.Token
 	err := windows.WTSQueryUserToken(sid, &tok)
 	if err == nil {
 		tok.Close()
-		return tokenPresent
+		return true
 	}
-	if errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) {
-		return tokenUnknown
-	}
-	return tokenAbsent
+	return errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD)
 }
 
-// activeSessions lists the sessions in the active state, the console session
-// first when it is among them, so a multi-session host prefers the physical
-// console over whichever session the enumeration happens to return first.
-func activeSessions() []uint32 {
+// ActiveConsoleSession returns the session id of a signed-in user, preferring the
+// one attached to the physical console.
+//
+// A session is active with no user signed in whenever the machine sits at a logon
+// screen, and launching into one can only fail. So a session counts here only
+// once a user token exists for it; reporting it ready earlier is what made a
+// service retry, and log, for as long as nobody signed in.
+func ActiveConsoleSession() (uint32, bool) {
 	console := windows.WTSGetActiveConsoleSessionId()
+	if console != noSession && hasSignedInUser(console) {
+		return console, true
+	}
 	var p *windows.WTS_SESSION_INFO
 	var n uint32
-	if err := windows.WTSEnumerateSessions(0, 0, 1, &p, &n); err != nil {
-		if console != noSession {
-			return []uint32{console}
-		}
-		return nil
-	}
-	defer windows.WTSFreeMemory(uintptr(unsafe.Pointer(p)))
-	var out []uint32
-	for _, s := range unsafe.Slice(p, n) {
-		if s.State != windows.WTSActive {
-			continue
-		}
-		if s.SessionID == console {
-			out = append([]uint32{s.SessionID}, out...)
-			continue
-		}
-		out = append(out, s.SessionID)
-	}
-	return out
-}
-
-// ActiveConsoleSession returns the session id currently attached to the console
-// and whether a user is signed in there.
-//
-// A session is active with no user signed in whenever the machine sits at a
-// logon screen, and launching into such a session can only fail. So a session
-// counts as usable here only once a user token actually exists for it;
-// reporting it as ready earlier is what made a service retry, and log, for as
-// long as nobody signed in.
-func ActiveConsoleSession() (uint32, bool) {
-	for _, sid := range activeSessions() {
-		switch sessionToken(sid) {
-		case tokenPresent:
-			return sid, true
-		case tokenUnknown:
-			// Not a service, so fall back to the state the session reports.
-			return sid, true
+	if err := windows.WTSEnumerateSessions(0, 0, 1, &p, &n); err == nil {
+		defer windows.WTSFreeMemory(uintptr(unsafe.Pointer(p)))
+		for _, s := range unsafe.Slice(p, n) {
+			if s.State == windows.WTSActive && s.SessionID != console && hasSignedInUser(s.SessionID) {
+				return s.SessionID, true
+			}
 		}
 	}
 	return noSession, false

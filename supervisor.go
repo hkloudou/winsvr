@@ -41,19 +41,11 @@ type Supervisor struct {
 	Hidden bool
 	// MinBackoff/MaxBackoff bound the exponential restart delay (default 2s/30s).
 	MinBackoff, MaxBackoff time.Duration
-	// HealthyAfter is how long the payload must stay up before the restart
-	// backoff resets to MinBackoff (default 30s). It is separate from
-	// MaxBackoff on purpose: how long a run has to last to count as healthy
-	// has nothing to do with how long the longest retry pause may be.
-	HealthyAfter time.Duration
 	// HTTPClient overrides the client used for the update check and download.
 	// The default allows five minutes for one whole request, body included, and
 	// refuses a redirect that drops TLS. Supply your own for a large payload on
-	// a slow link, leaving Timeout unset so only the context bounds the
-	// transfer.
+	// a slow link, with no Timeout, so only the context bounds the transfer.
 	HTTPClient *http.Client
-	// MaxUpdateBytes caps the payload download (default DefaultMaxBytes).
-	MaxUpdateBytes int64
 	// Logger receives progress logs. Defaults to no-op; wire NewEventLogger for
 	// a service, or a stderr slog handler for interactive debugging.
 	Logger *slog.Logger
@@ -133,10 +125,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if max < min {
 		max = min
 	}
-	healthy := s.HealthyAfter
-	if healthy <= 0 {
-		healthy = 30 * time.Second
-	}
 	backoff := min
 	for ctx.Err() == nil {
 		log.Debug("waiting for an active user session")
@@ -149,9 +137,8 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		proc, err := LaunchInSession(sid, LaunchOptions{Path: bin, Elevated: s.Elevated, Hidden: s.Hidden})
 		if err != nil {
 			// A user who signed out between the session check and the launch is
-			// not a failure. Go back to waiting rather than logging an error and
-			// widening the backoff, which at a logon screen would otherwise
-			// repeat for as long as the machine sits there.
+			// not a failure: wait again rather than logging an error and widening
+			// the backoff, which at a logon screen would repeat indefinitely.
 			if errors.Is(err, ErrNoUserSession) {
 				log.Info("no interactive user yet; waiting for sign-in", "session", sid)
 				if !sleep(ctx, min) {
@@ -178,7 +165,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		// Reset the backoff only after the payload stayed up long enough to be
 		// considered healthy. A payload that starts but crashes immediately must
 		// keep backing off, or it would restart-storm at the minimum interval.
-		if time.Since(started) >= healthy {
+		if time.Since(started) >= healthyAfter {
 			backoff = min
 		}
 		if werr != nil {
@@ -194,22 +181,15 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	return nil
 }
 
-// updateBeforeLaunch runs the update check and installs a newer payload,
-// retrying until the check succeeds or ctx is cancelled. That covers waiting for
-// the network and equally a server that cannot identify its payload, such as one
-// sending no ETag: the payload does not launch until the check passes.
+// updateBeforeLaunch runs the update check and installs a newer payload, retrying
+// until it succeeds or ctx is cancelled. That covers waiting for the network and
+// equally a server that cannot identify its payload, such as one sending no ETag:
+// the payload does not launch until the check passes.
 func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
 	log := s.log()
 	// Pass the logger so the Updater logs the ETag/version comparison and the
 	// resulting action ("update check ... needsUpdate=... action=...").
-	up := &Updater{
-		URL:      s.UpdateURL,
-		Path:     bin,
-		Sidecar:  s.Sidecar,
-		Client:   s.HTTPClient,
-		MaxBytes: s.MaxUpdateBytes,
-		Logger:   log,
-	}
+	up := &Updater{URL: s.UpdateURL, Path: bin, Sidecar: s.Sidecar, Client: s.HTTPClient, Logger: log}
 
 	const maxWait = 60 * time.Second
 	wait := 2 * time.Second
@@ -222,10 +202,10 @@ func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
 		if ctx.Err() != nil {
 			return ctx.Err() // the service is stopping, not an update failure
 		}
-		// Most commonly this is "no network yet", so keep waiting. A bad URL, a
-		// 404, a missing ETag and an incomplete sidecar all land here too, and
-		// repeat in the log rather than being worked around: the payload is
-		// required to be identifiable before it runs. The error says which it is.
+		// Usually "no network yet", so keep waiting. A bad URL, a 404, a missing
+		// ETag and an incomplete sidecar land here too and repeat in the log
+		// rather than being worked around: the payload has to be identifiable
+		// before it runs. The error says which it is.
 		log.Warn("update check failed; will retry", "attempt", attempt, "err", err, "retryIn", wait.String())
 		if !sleep(ctx, wait) {
 			return ctx.Err()
@@ -234,6 +214,11 @@ func (s *Supervisor) updateBeforeLaunch(ctx context.Context, bin string) error {
 	}
 	return ctx.Err()
 }
+
+// healthyAfter is how long the payload must stay up before the restart backoff
+// resets to MinBackoff. It is deliberately not MaxBackoff, which bounds the pause
+// between retries and says nothing about how long a run must last to count.
+const healthyAfter = 30 * time.Second
 
 func sleep(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
