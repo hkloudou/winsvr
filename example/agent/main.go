@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -164,12 +165,35 @@ func ensureAdmin(cmd string) error {
 // runLogger returns the logger for the "run" command: the Windows Event Log when
 // running as a service (a service has no console), and verbose stderr logging
 // when started interactively — so `agent run` in a terminal shows the full trace.
+//
+// A service that cannot open the event log, because its source is missing, must
+// not fall back to stderr: nothing is attached to it, so every line including
+// "Run returned an error" would vanish and the service would run with no
+// diagnostics at all. Fall back to a file next to the executable instead.
 func runLogger() (*slog.Logger, func() error) {
 	if isSvc, _ := winsvr.IsWindowsService(); isSvc {
 		if l, closeLog, err := winsvr.NewEventLogger(config.Name); err == nil {
 			return l, closeLog
 		}
+		if l, closeLog, err := fileLogger(); err == nil {
+			return l, closeLog
+		}
 	}
 	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
 	return slog.New(h), nil
+}
+
+// fileLogger appends to <service name>.log beside the executable. It is the
+// fallback for a service whose event-log source could not be opened.
+func fileLogger() (*slog.Logger, func() error, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(filepath.Dir(exe), config.Name+".log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, nil, err
+	}
+	return slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo})), f.Close, nil
 }

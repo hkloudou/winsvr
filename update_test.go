@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestUpdaterHEAD(t *testing.T) {
@@ -506,5 +507,107 @@ func TestUpdaterETagKeepsState(t *testing.T) {
 	}
 	if _, ok := raw["crc64"]; !ok {
 		t.Error("state must record the installed checksum, to notice a local change")
+	}
+}
+
+// A process killed mid-download cannot clean up after itself, and nothing else
+// used to remove what it left beside the payload.
+func TestUpdaterSweepsAbandonedDownloads(t *testing.T) {
+	const body = "payload-v1"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		if r.Method == http.MethodGet {
+			fmt.Fprint(w, body)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	u := &Updater{URL: srv.URL, Path: filepath.Join(dir, "helper.bin")}
+
+	stale := filepath.Join(dir, "helper.bin.tmp-999999")
+	fresh := filepath.Join(dir, "helper.bin.tmp-111111")
+	other := filepath.Join(dir, "unrelated.tmp-222222")
+	for _, p := range []string{stale, fresh, other} {
+		if err := os.WriteFile(p, []byte("partial"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Only the stale one is old enough to be swept.
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(other, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := u.EnsureLatest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); err == nil {
+		t.Error("an abandoned download older than the cutoff must be removed")
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Error("a recent temporary file may belong to a download in flight; it must be left alone")
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Error("a file that is not this payload's temporary must be left alone")
+	}
+	if got, _ := os.ReadFile(u.Path); string(got) != body {
+		t.Fatalf("payload = %q, want %q", got, body)
+	}
+}
+
+// install removes the existing payload before renaming the download over it, which
+// is deliberate. This pins what that costs, so the behaviour cannot drift
+// unnoticed: when the rename cannot be made, the old payload is gone too, and no
+// state is recorded, so the next check downloads again.
+//
+// The other failed-install test cannot reach this window, because its fixture is a
+// non-empty directory on which the remove itself fails.
+func TestInstallRemovesThePayloadBeforeItKnowsTheRenameWorks(t *testing.T) {
+	dir := t.TempDir()
+	u := &Updater{URL: "http://example.invalid/helper.bin", Path: filepath.Join(dir, "helper.bin")}
+	if err := os.WriteFile(u.Path, []byte("the old payload"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A download that is not there can never be renamed into place.
+	if err := u.install(context.Background(), filepath.Join(dir, "helper.bin.tmp-404")); err == nil {
+		t.Fatal("install with no downloaded file must report an error")
+	}
+	if _, err := os.Stat(u.Path); err == nil {
+		t.Fatal("the payload survived: the remove-first window is gone, so update install's doc comment")
+	}
+	if _, err := os.Stat(u.statePath()); err == nil {
+		t.Error("no state may be recorded for an install that did not happen")
+	}
+}
+
+// The sweep must only touch names os.CreateTemp could have produced, so a file
+// someone put there by hand is left alone.
+func TestSweepOnlyMatchesGeneratedTempNames(t *testing.T) {
+	const prefix = "helper.bin.tmp-"
+	for name, want := range map[string]bool{
+		"helper.bin.tmp-123456":         true,
+		"helper.bin.tmp-0":              true,
+		"helper.bin.tmp-4294967295":     true,  // the largest uint32
+		"helper.bin.tmp-4294967296":     false, // one past it
+		"helper.bin.tmp-20260912123456": false, // a timestamp-shaped backup
+		"helper.bin.tmp-007":            false, // leading zeroes
+		"helper.bin.tmp-backup":         false,
+		"helper.bin.tmp-":               false,
+		"helper.bin.tmp-12a":            false,
+		"helper.bin.tmp-12.old":         false,
+		"helper.bin.tmp--1":             false,
+		"helper.bin.tmp-+1":             false,
+		"helper.bin.tmp- 12":            false,
+		"helper.bin":                    false,
+		"helper.bin.update.json":        false,
+		"otherpayload.tmp-123":          false,
+	} {
+		if got := isGeneratedTemp(name, prefix); got != want {
+			t.Errorf("isGeneratedTemp(%q) = %v, want %v", name, got, want)
+		}
 	}
 }

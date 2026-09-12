@@ -207,7 +207,10 @@ func (p *Process) Wait(ctx context.Context) (uint32, error) {
 		switch ev {
 		case windows.WAIT_OBJECT_0:
 			var code uint32
-			windows.GetExitCodeProcess(p.handle, &code)
+			if err := windows.GetExitCodeProcess(p.handle, &code); err != nil {
+				// Without this the zero value reads as a clean exit.
+				return 0, fmt.Errorf("GetExitCodeProcess: %w", err)
+			}
 			return code, nil
 		case waitTimeout:
 			select {

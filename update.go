@@ -34,6 +34,18 @@ const (
 	downloadAttempts  = 3
 )
 
+// staleTempAge is how old an abandoned download has to be before a sweep removes
+// it. Well above defaultTimeout, so a transfer still in flight is never taken out
+// from under itself.
+//
+// The age is a heuristic rather than proof that nothing owns the file, and it does
+// not need to be more than that: Go opens files on Windows without
+// FILE_SHARE_DELETE, so a download another process still holds open cannot be
+// removed at all, and one Updater per payload path is an invariant of Supervisor.
+// A sweep that somehow lost a race would cost one retried download, never the
+// payload itself.
+const staleTempAge = time.Hour
+
 // fileCRC64 returns the CRC-64/ECMA checksum of a file. An unreadable or absent
 // file is an error, never a checksum of zero, so a read failure cannot be
 // mistaken for a valid digest.
@@ -121,10 +133,51 @@ type payloadInfo struct {
 // returns whether a download happened. Every failure is returned rather than
 // worked around.
 func (u *Updater) EnsureLatest(ctx context.Context) (bool, error) {
+	u.sweepTemps()
 	if u.Sidecar {
 		return u.ensureSidecar(ctx)
 	}
 	return u.ensureETag(ctx)
+}
+
+// isGeneratedTemp reports whether name is one os.CreateTemp could have produced
+// for this payload. It fills the pattern's "*" with a uint32 in canonical decimal,
+// so anything else is somebody's own file and not ours to delete: not just
+// "helper.bin.tmp-backup", but a timestamp like "helper.bin.tmp-20260912123456",
+// which is too large, and "helper.bin.tmp-007", which has leading zeroes.
+func isGeneratedTemp(name, prefix string) bool {
+	suffix, ok := strings.CutPrefix(name, prefix)
+	if !ok {
+		return false
+	}
+	n, err := strconv.ParseUint(suffix, 10, 32)
+	return err == nil && strconv.FormatUint(n, 10) == suffix
+}
+
+// sweepTemps removes downloads abandoned beside the payload. Every error path in
+// a download cleans up after itself, but a process killed mid-transfer, by a
+// service stop or a power cut, cannot, and nothing else would ever remove what it
+// left. Only files older than staleTempAge go, so a concurrent download survives.
+func (u *Updater) sweepTemps() {
+	dir := filepath.Dir(u.Path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	prefix := filepath.Base(u.Path) + ".tmp-"
+	cutoff := time.Now().Add(-staleTempAge)
+	for _, e := range entries {
+		if e.IsDir() || !isGeneratedTemp(e.Name(), prefix) {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if rerr := os.Remove(filepath.Join(dir, e.Name())); rerr == nil && u.Logger != nil {
+			u.Logger.Info("update: removed an abandoned download", "path", e.Name())
+		}
+	}
 }
 
 // ensureETag keeps the payload in step with the ETag the server reports, which is
@@ -371,10 +424,15 @@ func (u *Updater) fetch(ctx context.Context, want payloadInfo) (string, payloadI
 	return tmpName, payloadInfo{ETag: etag, CRC64: sum}, nil
 }
 
-// install puts the downloaded file in place. The existing payload is removed
-// first so the rename cannot be refused over a destination already there, then
-// the rename is retried briefly: giving up on the first transient lock would
-// leave no payload at all.
+// install puts the downloaded file in place.
+//
+// The existing payload is removed first, deliberately, so the rename cannot be
+// refused over a destination that is already there. Be clear about what that
+// costs: between the remove and a successful rename there is no payload, and if
+// every attempt fails there is none afterwards either. The retries ride out the
+// common case, a scanner holding the new file for a moment. Recovery comes from
+// the state file, which is written only on success, so the next service start
+// downloads again.
 func (u *Updater) install(ctx context.Context, tmpName string) error {
 	_ = os.Remove(u.Path)
 	var err error
