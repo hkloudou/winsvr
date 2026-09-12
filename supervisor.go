@@ -30,10 +30,6 @@ type Supervisor struct {
 	// UpdateURL is the remote payload. Empty disables updates (the local Bin is
 	// launched directly, with no network wait).
 	UpdateURL string
-	// Elevated launches the payload with the user's elevated token (no UAC
-	// prompt, since the service is LocalSystem). A "requireAdministrator"
-	// payload requires this; an "asInvoker" payload should leave it false.
-	Elevated bool
 	// Hidden launches the payload without a console window. Recommended; also
 	// build the payload with `-ldflags -H windowsgui`.
 	Hidden bool
@@ -91,7 +87,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	log.Info("service starting",
 		"payload", bin,
 		"updateURL", s.UpdateURL,
-		"elevated", s.Elevated,
 		"hidden", s.Hidden)
 
 	// 1. Update check — before the payload runs, and only after the network is
@@ -146,7 +141,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return nil
 		}
 		log.Info("launching payload", "session", sid, "path", bin)
-		proc, err := LaunchInSession(sid, LaunchOptions{Path: bin, Elevated: s.Elevated, Hidden: s.Hidden})
+		proc, err := LaunchInSession(sid, LaunchOptions{Path: bin, Hidden: s.Hidden})
 		if err != nil {
 			// A user who signed out between the session check and the launch is
 			// not a failure: wait again rather than logging an error and widening

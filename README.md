@@ -182,10 +182,6 @@ stale or corrupted payload. It does not defend against an attacker.
   that directory can replace either binary, and replacing the service exe means
   SYSTEM at the next boot. Install under `%ProgramFiles%`, or anywhere else only
   administrators can write. Never install from a download folder.
-- **`Elevated` is not a privilege boundary.** It launches the payload with the
-  signed-in user's linked admin token, inside that user's own session, where
-  they can debug it or inject into it. It also needs that user to be an
-  administrator: a standard user has no linked token, and the launch fails.
 
 ### Using the primitives directly
 
@@ -226,11 +222,11 @@ CGO_ENABLED=0 GOOS=windows GOARCH=386  go build -trimpath -ldflags "-s -w -H win
 `i686-w64-mingw32-gcc` for 386). `-H windowsgui` (the PE subsystem) and the
 manifest (an RT_MANIFEST resource) are independent — the payload wants both.
 
-> **Don't swap the manifests.** A payload launched as a standard user must be
-> `asInvoker`; a `requireAdministrator` payload can't start via
-> `CreateProcessAsUser` (`ERROR_ELEVATION_REQUIRED`). To run the payload
-> elevated, set `Supervisor.Elevated` (the service holds the user's linked admin
-> token) — don't change its manifest.
+> **Don't swap the manifests.** The payload must be `asInvoker`: a
+> `requireAdministrator` one cannot start through `CreateProcessAsUser` and fails
+> with `ERROR_ELEVATION_REQUIRED`. The payload runs with the signed-in user's own
+> rights, and that is the point of it. Anything that genuinely needs privilege
+> belongs in the service, which already runs as `LocalSystem`.
 
 ## Layout
 

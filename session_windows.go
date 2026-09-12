@@ -81,11 +81,10 @@ func WaitForActiveConsole(ctx context.Context, poll time.Duration) (uint32, erro
 
 // LaunchOptions configures a launch into a user session.
 type LaunchOptions struct {
-	Path     string   // executable path (required)
-	Args     []string // arguments
-	Dir      string   // working directory (defaults to Path's directory)
-	Elevated bool     // launch with the user's linked admin token (needs the user to be an admin)
-	Hidden   bool     // no window (CREATE_NO_WINDOW)
+	Path   string   // executable path (required)
+	Args   []string // arguments
+	Dir    string   // working directory (defaults to Path's directory)
+	Hidden bool     // no window (CREATE_NO_WINDOW)
 }
 
 // Process is a launched payload process wrapped in a kill-on-close job.
@@ -95,7 +94,7 @@ type Process struct {
 	job    windows.Handle
 }
 
-func userToken(sessionID uint32, elevated bool) (windows.Token, error) {
+func userToken(sessionID uint32) (windows.Token, error) {
 	var user windows.Token
 	if err := windows.WTSQueryUserToken(sessionID, &user); err != nil {
 		if errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) {
@@ -108,23 +107,16 @@ func userToken(sessionID uint32, elevated bool) (windows.Token, error) {
 		return 0, fmt.Errorf("%w: session %d: %w", ErrNoUserSession, sessionID, err)
 	}
 	defer user.Close()
-	src := user
-	if elevated && !user.IsElevated() {
-		linked, err := user.GetLinkedToken()
-		if err != nil {
-			return 0, fmt.Errorf("session %d has no elevated token: %w", sessionID, err)
-		}
-		defer linked.Close()
-		src = linked
-	}
 	var primary windows.Token
-	if err := windows.DuplicateTokenEx(src, windows.MAXIMUM_ALLOWED, nil, windows.SecurityImpersonation, windows.TokenPrimary, &primary); err != nil {
+	if err := windows.DuplicateTokenEx(user, windows.MAXIMUM_ALLOWED, nil, windows.SecurityImpersonation, windows.TokenPrimary, &primary); err != nil {
 		return 0, fmt.Errorf("DuplicateTokenEx: %w", err)
 	}
 	return primary, nil
 }
 
-// LaunchInSession starts o.Path in sessionID's desktop as that session's user.
+// LaunchInSession starts o.Path in sessionID's desktop as that session's user,
+// with that user's own rights. Work needing privilege belongs in the service,
+// which already runs as LocalSystem.
 // The process is wrapped in a kill-on-close job so it dies when the returned
 // Process is Closed (or when the service process exits). The caller must run as
 // LocalSystem.
@@ -132,7 +124,7 @@ func LaunchInSession(sessionID uint32, o LaunchOptions) (*Process, error) {
 	if o.Path == "" {
 		return nil, errors.New("winsvr: LaunchOptions.Path is required")
 	}
-	tok, err := userToken(sessionID, o.Elevated)
+	tok, err := userToken(sessionID)
 	if err != nil {
 		return nil, err
 	}
