@@ -8,8 +8,8 @@ in the logged-on user's desktop session.
   `golang.org/x/sys/windows/svc`.
 - Launch a program **as the interactive user** from a `LocalSystem` service,
   wrapped in a kill-on-close Job Object so it can't outlive the service.
-- **Self-updating**: one cheap `HEAD` check at boot, verified install,
-  crash-restart.
+- **Self-updating**: one cheap `HEAD` check at boot, a size-capped download that
+  the `GET`'s own `ETag` has to agree with, crash-restart.
 - Builds on every OS — non-Windows gets stubs, so your logic stays testable on
   Linux/macOS CI.
 
@@ -118,13 +118,16 @@ payload is launched. The sequence guarantees the payload that runs is current:
    differs from the one on disk, when there is none, or when the payload no
    longer matches the checksum it is supposed to have. That last case is what
    catches a payload corrupted or replaced locally while the remote stayed put.
-3. **Verify, then swap.** Check the size and the checksum before anything is
-   installed. The swap removes the old file and renames the new one into place,
-   retrying for a moment, so a scanner holding a transient lock cannot leave the
-   machine with no payload at all. It runs while the payload is stopped, so the
-   file is not in use. In ETag mode the validator is recorded from the `GET`
-   rather than the `HEAD`: if a release lands between the two, the body is read
-   again, so what gets stored always describes the bytes on disk.
+3. **Check, then swap.** The validator is recorded from the `GET` rather than the
+   `HEAD`: if a release lands between the two the ETags disagree, and the body is
+   read again, so what gets stored always describes the bytes on disk. The
+   download is also capped, at `DefaultMaxBytes` unless `Updater.MaxBytes` says
+   otherwise. Be clear about what this is not: there is no published digest to
+   check the bytes against, so this is ETag consistency, not verification. The
+   swap then removes the old file and renames the new one into place, retrying
+   for a moment so a scanner holding a transient lock cannot leave the machine
+   with no payload at all. It runs while the payload is stopped, so the file is
+   not in use.
 4. Launch the now-current payload in the user's session.
 5. Supervise it (restart on crash). **No further update checks** until the next
    service start.
@@ -168,12 +171,16 @@ with no `Timeout` and let the service's context bound the transfer instead.
 Read this before pointing `UpdateURL` at anything. The check defends against a
 stale or corrupted payload. It does not defend against an attacker.
 
-- **Nothing here authenticates the payload.** The ETag says the remote changed;
-  it does not say who changed it. The checksum finds corruption on disk, not
-  tampering: CRC-64 is not a cryptographic hash, and it is linear, so producing
-  content that matches a given value is easy. For authenticity, verify a real
-  signature over the downloaded file against a public key compiled into the
-  service, before it is installed.
+- **The downloaded bytes are never checked against anything.** No digest is
+  published, so a server or CDN that serves the wrong complete body under the
+  expected `ETag` gets those bytes installed, and the checksum taken afterwards
+  then records them as the good copy. The `ETag` says the remote changed; it does
+  not say what it changed to, or who changed it.
+- **The recorded checksum is for corruption, not tampering.** It catches a
+  payload altered on disk after install. CRC-64 is not a cryptographic hash, and
+  it is linear, so producing content that matches a given value is easy. For
+  authenticity, verify a real signature over the download against a public key
+  compiled into the service, before it is installed.
 - **Use HTTPS.** Nothing here rejects an `http://` URL. The default client does
   refuse a redirect that drops TLS, so an `https://` URL cannot be steered onto
   plain HTTP, but that only helps if you started with `https://`.
