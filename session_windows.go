@@ -230,6 +230,13 @@ func LaunchInSession(sessionID uint32, o LaunchOptions) (*Process, error) {
 	var pi windows.ProcessInformation
 	if err := windows.CreateProcessAsUser(tok, exe16, cmd16, nil, nil, false, flags, env, dir16, &si, &pi); err != nil {
 		windows.CloseHandle(job)
+		if errors.Is(err, windows.ERROR_ELEVATION_REQUIRED) {
+			// The manifest asks for administrator and this token cannot supply
+			// it. Marked so Supervisor can tell this apart from every other way
+			// a launch fails; Windows' own message says elevation is required
+			// without saying by whom or what to do about it.
+			return nil, fmt.Errorf("%w: CreateProcessAsUser(%s): %w; set Supervisor.LaunchElevated to launch it with the user's elevated token", ErrElevationRequired, o.Path, err)
+		}
 		return nil, fmt.Errorf("CreateProcessAsUser(%s): %w", o.Path, err)
 	}
 	defer windows.CloseHandle(pi.Thread)

@@ -121,3 +121,46 @@ func TestElevationErrorsAreDistinct(t *testing.T) {
 		t.Error("a wrapped ErrNoElevatedToken must not read as ErrNoUserSession")
 	}
 }
+
+// The auto-elevate retry fires on exactly one failure and at most once, so both
+// halves are worth pinning: it must not treat other launch failures as a reason
+// to raise privilege, and it must not loop.
+func TestShouldAutoElevate(t *testing.T) {
+	required := fmt.Errorf("launch: %w", ErrElevationRequired)
+	cases := []struct {
+		name            string
+		err             error
+		alreadyElevated bool
+		disabled        bool
+		want            bool
+	}{
+		{"the payload said it needs administrator", required, false, false, true},
+		{"bare sentinel, not wrapped", ErrElevationRequired, false, false, true},
+		{"never twice in one run", required, true, false, false},
+		{"switched off by the deployment", required, false, true, false},
+		{"off and already elevated", required, true, true, false},
+		{"any other failure is not a reason to raise privilege", errors.New("access denied"), false, false, false},
+		{"a missing session is not a reason either", ErrNoUserSession, false, false, false},
+		{"nor is a user who has no elevated token", ErrNoElevatedToken, false, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldAutoElevate(c.err, c.alreadyElevated, c.disabled); got != c.want {
+				t.Errorf("shouldAutoElevate(%v, %v, %v) = %v, want %v",
+					c.err, c.alreadyElevated, c.disabled, got, c.want)
+			}
+		})
+	}
+}
+
+// Auto-elevate is on when the field is left alone, which is what makes the zero
+// value mean "default true" despite Go's zero value being false.
+func TestAutoElevateDefaultsOn(t *testing.T) {
+	var s Supervisor
+	if s.DisableAutoElevate {
+		t.Fatal("the zero value must leave auto-elevate enabled")
+	}
+	if s.LaunchElevated {
+		t.Fatal("the zero value must not launch elevated up front")
+	}
+}

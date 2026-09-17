@@ -36,6 +36,12 @@ var ErrNoUserSession = errors.New("winsvr: no user signed in to the session")
 // configured to need.
 var ErrNoElevatedToken = errors.New("winsvr: the session's user has no elevated token")
 
+// ErrElevationRequired reports that the payload's manifest asks for
+// administrator, so a filtered token cannot start it at all: Windows refuses
+// with ERROR_ELEVATION_REQUIRED before the process exists. Supervisor treats it
+// as the signal to retry elevated, unless DisableAutoElevate says not to.
+var ErrElevationRequired = errors.New("winsvr: the payload requires administrator")
+
 // Logged is an optional interface a Service may implement so winsvr.Run can log
 // framework-level events to the service's own logger — most importantly, the
 // error returned when Run exits unexpectedly, which would otherwise be silent.

@@ -1,5 +1,7 @@
 package winsvr
 
+import "errors"
+
 // Token elevation types, from Windows' TOKEN_ELEVATION_TYPE in winnt.h.
 // golang.org/x/sys/windows exports the TokenElevationType information class but
 // not the values it returns, so they are spelled out here. They are declared
@@ -49,4 +51,23 @@ func chooseElevation(kind uint32, tokenIsElevated bool) elevationChoice {
 		}
 		return elevateImpossible
 	}
+}
+
+// shouldAutoElevate reports whether a launch that failed should be tried again
+// with the elevated token.
+//
+// Only one failure qualifies: Windows refusing to start a payload whose manifest
+// requires administrator. That is not a guess about what the payload wants, it is
+// the payload saying so in the only way the loader listens to. A launch that was
+// already elevated is never retried, so this can fire at most once per Run.
+//
+// Note what this delegates. The payload arrives over a channel nothing
+// authenticates, so with the retry enabled its own manifest decides whether it
+// runs as administrator. That is the default, and DisableAutoElevate is how a
+// deployment keeps the decision to itself.
+func shouldAutoElevate(err error, alreadyElevated, disabled bool) bool {
+	if alreadyElevated || disabled {
+		return false
+	}
+	return errors.Is(err, ErrElevationRequired)
 }

@@ -58,6 +58,22 @@ type Supervisor struct {
 	// rather than launching a payload without the rights it was configured to
 	// need.
 	LaunchElevated bool
+	// DisableAutoElevate turns off the retry described here. It is named in the
+	// negative because the retry is on by default and Go's zero value is false;
+	// the same shape as http.Transport.DisableKeepAlives.
+	//
+	// By default a payload whose manifest says requireAdministrator is launched
+	// elevated even when LaunchElevated is not set. Such a payload cannot start
+	// from a filtered token at all, so the first attempt fails with
+	// ERROR_ELEVATION_REQUIRED and is retried once with the elevated token. The
+	// answer is remembered for the rest of the run, so later restarts go
+	// straight there, and the first time it happens is logged.
+	//
+	// Understand what that delegates. The payload arrives over a channel nothing
+	// authenticates, so its manifest, and in effect whoever controls the URL it
+	// came from, decides whether it runs as administrator. Set this to keep that
+	// decision here, where LaunchElevated alone then answers it.
+	DisableAutoElevate bool
 	// Hidden launches the payload without a console window. Recommended; also
 	// build the payload with `-ldflags -H windowsgui`.
 	Hidden bool
@@ -116,6 +132,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		"payload", bin,
 		"updateURL", s.UpdateURL,
 		"elevated", s.LaunchElevated,
+		"autoElevate", !s.DisableAutoElevate,
 		"hidden", s.Hidden)
 
 	// 1. Update check — before the payload runs, and only after the network is
@@ -154,6 +171,10 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if max < min {
 		max = min
 	}
+	// Whether to launch elevated. It starts at the configured value and can be
+	// raised once, by the auto-elevate retry below, which is what keeps every
+	// later restart from failing the same way first.
+	elevate := s.LaunchElevated
 	backoff := min
 	for ctx.Err() == nil {
 		log.Debug("waiting for an active user session")
@@ -170,14 +191,24 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return nil
 		}
 		log.Info("launching payload", "session", sid, "path", bin)
-		proc, err := LaunchInSession(sid, LaunchOptions{Path: bin, Elevated: s.LaunchElevated, Hidden: s.Hidden})
+		proc, err := LaunchInSession(sid, LaunchOptions{Path: bin, Elevated: elevate, Hidden: s.Hidden})
 		if err != nil {
-			// LaunchElevated is set but this user cannot satisfy it. Waiting
-			// will not change that, and a backoff would bury a configuration
-			// mistake under a retry loop, so exit and let the SCM record it.
+			// An elevated launch was needed but this user cannot supply one.
+			// Waiting will not change that, and a backoff would bury a
+			// configuration mistake under a retry loop, so exit and let the SCM
+			// record it.
 			if errors.Is(err, ErrNoElevatedToken) {
 				log.Error("cannot launch elevated; service will exit", "session", sid, "err", err)
 				return err
+			}
+			if shouldAutoElevate(err, elevate, s.DisableAutoElevate) {
+				// Logged at warning level on purpose: the payload is about to
+				// run as administrator without anyone having configured that.
+				log.Warn("the payload's manifest requires administrator; launching it elevated",
+					"path", bin,
+					"note", "set LaunchElevated to make this explicit, or DisableAutoElevate to refuse it")
+				elevate = true
+				continue
 			}
 			// A user who signed out between the session check and the launch is
 			// not a failure: wait again rather than logging an error and widening

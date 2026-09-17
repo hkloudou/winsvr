@@ -201,6 +201,33 @@ That is `ErrNoElevatedToken`, and the service exits rather than launching a
 payload without the rights it was configured to need. Retrying would not help and
 would bury the misconfiguration under a backoff.
 
+#### Automatic elevation, and how to turn it off
+
+A payload whose manifest says `requireAdministrator` is launched elevated **even
+when `LaunchElevated` is not set**. It cannot start otherwise, so the first
+attempt fails with `ERROR_ELEVATION_REQUIRED` and is retried once with the
+elevated token. The answer is remembered for the rest of the run, so later
+crash-restarts go straight there, and the first time it happens is logged at
+warning level.
+
+Know what this delegates, because it is on by default. The payload arrives over a
+channel that nothing authenticates: an `ETag` says the remote changed, not what it
+changed to or who changed it. So with the retry enabled, the payload's own
+manifest decides whether it runs as administrator, and in effect so does whoever
+controls the URL it is fetched from.
+
+`Supervisor.DisableAutoElevate` keeps that decision in your configuration, where
+`LaunchElevated` alone then answers it. It is named in the negative because Go's
+zero value is `false` and the retry is on by default, the same shape as
+`http.Transport.DisableKeepAlives`.
+
+Worth weighing honestly: on a machine where the signed-in user is an
+administrator, code already running as that user has other ways across, and
+Microsoft does not treat UAC as a security boundary. On a machine where they are
+a standard user, the retry cannot succeed anyway. So the added exposure is real
+but narrower than it first looks. Set it if you want privilege declared where you
+deploy rather than where you build.
+
 `UIAccess` is the other way to cross UIPI, and this library does not offer it: it
 requires a signed binary installed under `%ProgramFiles%`, which a payload
 downloaded next to the service executable cannot satisfy.
@@ -270,9 +297,9 @@ manifest (an RT_MANIFEST resource) are independent — the payload wants both.
 
 > **Mind the manifests.** An `asInvoker` payload is the default and the right
 > one for almost everything. A `requireAdministrator` payload cannot start from a
-> filtered token at all, failing with `ERROR_ELEVATION_REQUIRED`, so it needs
-> `Supervisor.LaunchElevated` — see below. Work that needs privilege but no
-> desktop does not need either: put it in the service, which is already
+> filtered token at all: it is launched elevated automatically, which is worth
+> understanding before you rely on it — see below. Work that needs privilege but
+> no desktop does not need either: put it in the service, which is already
 > `LocalSystem`.
 
 ## Layout
