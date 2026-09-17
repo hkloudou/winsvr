@@ -166,6 +166,45 @@ For a large payload on a slow link, `HTTPClient` replaces the default client,
 which allows five minutes for one whole request, body included. Supply your own
 with no `Timeout` and let the service's context bound the transfer instead.
 
+### Running the payload elevated
+
+`Supervisor.LaunchElevated` launches the payload with the signed-in user's
+elevated token, so it runs at high integrity. It is off by default, which is
+right unless one of these applies:
+
+- **The payload's manifest says `requireAdministrator`.** Such a binary cannot be
+  started from a filtered token, and the launch fails with
+  `ERROR_ELEVATION_REQUIRED`.
+- **The payload automates an application that is itself running as
+  administrator.** UIPI stops a medium-integrity process from reaching a
+  high-integrity window, so `SendMessage`, `PostMessage`, `SetWindowsHookEx` and
+  UI Automation are all refused. They are refused *quietly*: nothing errors, the
+  action just never happens, which makes this a slow thing to diagnose.
+
+No UAC prompt appears. The service runs as `LocalSystem`, which holds
+`SeTcbPrivilege`, so it takes the token rather than asking for consent — which is
+also why this works on a machine nobody is sitting at.
+
+What it costs:
+
+- The payload has administrator rights, so any flaw in it is an
+  administrator-level flaw.
+- Files and registry keys it creates carry high integrity. The signed-in user
+  cannot then modify them from an ordinary process, which surprises people who
+  did not expect the agent to be the reason a file is suddenly read-only.
+- It is **not** a privilege boundary. The process still runs inside the user's
+  own session, where that user owns it and can debug it. It buys integrity
+  level, not isolation.
+
+If the signed-in user is not an administrator there is no elevated token to take.
+That is `ErrNoElevatedToken`, and the service exits rather than launching a
+payload without the rights it was configured to need. Retrying would not help and
+would bury the misconfiguration under a backoff.
+
+`UIAccess` is the other way to cross UIPI, and this library does not offer it: it
+requires a signed binary installed under `%ProgramFiles%`, which a payload
+downloaded next to the service executable cannot satisfy.
+
 ### What auto-update does not protect you from
 
 Read this before pointing `UpdateURL` at anything. The check defends against a
@@ -229,11 +268,12 @@ CGO_ENABLED=0 GOOS=windows GOARCH=386  go build -trimpath -ldflags "-s -w -H win
 `i686-w64-mingw32-gcc` for 386). `-H windowsgui` (the PE subsystem) and the
 manifest (an RT_MANIFEST resource) are independent — the payload wants both.
 
-> **Don't swap the manifests.** The payload must be `asInvoker`: a
-> `requireAdministrator` one cannot start through `CreateProcessAsUser` and fails
-> with `ERROR_ELEVATION_REQUIRED`. The payload runs with the signed-in user's own
-> rights, and that is the point of it. Anything that genuinely needs privilege
-> belongs in the service, which already runs as `LocalSystem`.
+> **Mind the manifests.** An `asInvoker` payload is the default and the right
+> one for almost everything. A `requireAdministrator` payload cannot start from a
+> filtered token at all, failing with `ERROR_ELEVATION_REQUIRED`, so it needs
+> `Supervisor.LaunchElevated` — see below. Work that needs privilege but no
+> desktop does not need either: put it in the service, which is already
+> `LocalSystem`.
 
 ## Layout
 

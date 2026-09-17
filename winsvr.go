@@ -28,6 +28,14 @@ var ErrUnsupported = errors.New("winsvr: only supported on windows")
 // callers should wait for a sign-in instead of retrying harder.
 var ErrNoUserSession = errors.New("winsvr: no user signed in to the session")
 
+// ErrNoElevatedToken reports that an elevated launch was asked for but the user
+// signed in to the session is not an administrator, so no elevated token exists
+// to launch with. Unlike ErrNoUserSession this will not resolve by waiting: it
+// means LaunchElevated is set on a machine whose user cannot satisfy it, and it
+// is reported rather than quietly launching a payload without the rights it was
+// configured to need.
+var ErrNoElevatedToken = errors.New("winsvr: the session's user has no elevated token")
+
 // Logged is an optional interface a Service may implement so winsvr.Run can log
 // framework-level events to the service's own logger — most importantly, the
 // error returned when Run exits unexpectedly, which would otherwise be silent.
