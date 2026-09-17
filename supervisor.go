@@ -210,6 +210,16 @@ func (s *Supervisor) Run(ctx context.Context) error {
 				elevate = true
 				continue
 			}
+			// The retry above declined this one: either the deployment refused
+			// elevation, or the launch was already elevated and the payload
+			// still would not start. Neither the manifest nor the configuration
+			// changes while the service runs, so retrying can only fail the same
+			// way forever. Terminal, for the same reason ErrNoElevatedToken is.
+			if errors.Is(err, ErrElevationRequired) {
+				log.Error("the payload requires administrator and will not be launched elevated; service will exit",
+					"path", bin, "err", err)
+				return err
+			}
 			// A user who signed out between the session check and the launch is
 			// not a failure: wait again rather than logging an error and widening
 			// the backoff, which at a logon screen would repeat indefinitely.
