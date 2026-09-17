@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -81,10 +82,11 @@ func WaitForActiveConsole(ctx context.Context, poll time.Duration) (uint32, erro
 
 // LaunchOptions configures a launch into a user session.
 type LaunchOptions struct {
-	Path   string   // executable path (required)
-	Args   []string // arguments
-	Dir    string   // working directory (defaults to Path's directory)
-	Hidden bool     // no window (CREATE_NO_WINDOW)
+	Path     string   // executable path (required)
+	Args     []string // arguments
+	Dir      string   // working directory (defaults to Path's directory)
+	Elevated bool     // launch with the user's elevated token; see Supervisor.LaunchElevated
+	Hidden   bool     // no window (CREATE_NO_WINDOW)
 }
 
 // Process is a launched payload process wrapped in a kill-on-close job.
@@ -94,7 +96,43 @@ type Process struct {
 	job    windows.Handle
 }
 
-func userToken(sessionID uint32) (windows.Token, error) {
+// elevationType reads TOKEN_ELEVATION_TYPE from a token. x/sys exports the
+// information class but no wrapper for it, so the call is made directly.
+func elevationType(t windows.Token) (uint32, error) {
+	var kind, n uint32
+	err := windows.GetTokenInformation(t, windows.TokenElevationType,
+		(*byte)(unsafe.Pointer(&kind)), uint32(unsafe.Sizeof(kind)), &n)
+	if err != nil {
+		return 0, err
+	}
+	return kind, nil
+}
+
+// errnoText renders the numeric Windows error next to its message. The message
+// alone reads well but is hard to search for; the number is what documentation
+// and bug reports are written against.
+func errnoText(err error) string {
+	var e syscall.Errno
+	if !errors.As(err, &e) {
+		return ""
+	}
+	return fmt.Sprintf(" (windows error %d, 0x%X)", uint32(e), uint32(e))
+}
+
+// userToken returns a primary token for the user signed in to sessionID.
+//
+// When elevated is set the token has to carry administrator rights, which is a
+// three-way question rather than a flag: an administrator under UAC holds the
+// filtered half of a split token, and the elevated half has to be fetched
+// through TokenLinkedToken; with UAC switched off that same administrator's
+// token is already the full one; and a standard user has no elevated token
+// anywhere. Only the first case needs the extra call, so the elevation type
+// decides, and the third is reported as ErrNoElevatedToken rather than quietly
+// launching with less than was asked for.
+//
+// No UAC prompt appears at any point, because the service holds SeTcbPrivilege
+// as LocalSystem and is taking the token rather than asking for consent.
+func userToken(sessionID uint32, elevated bool) (windows.Token, error) {
 	var user windows.Token
 	if err := windows.WTSQueryUserToken(sessionID, &user); err != nil {
 		if errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) {
@@ -107,16 +145,39 @@ func userToken(sessionID uint32) (windows.Token, error) {
 		return 0, fmt.Errorf("%w: session %d: %w", ErrNoUserSession, sessionID, err)
 	}
 	defer user.Close()
+
+	src := user
+	if elevated {
+		kind, err := elevationType(user)
+		if err != nil {
+			return 0, fmt.Errorf("read the elevation type of session %d's token: %w%s", sessionID, err, errnoText(err))
+		}
+		switch chooseElevation(kind, user.IsElevated()) {
+		case elevateWithToken:
+			// Already elevated, so there is nothing to fetch.
+		case elevateWithLinked:
+			linked, lerr := user.GetLinkedToken()
+			if lerr != nil {
+				return 0, fmt.Errorf("get the elevated token linked to session %d's: %w%s", sessionID, lerr, errnoText(lerr))
+			}
+			defer linked.Close()
+			src = linked
+		default:
+			return 0, fmt.Errorf("%w: the user signed in to session %d is not an administrator, so there is no elevated token to launch with; clear LaunchElevated, or have an administrator sign in", ErrNoElevatedToken, sessionID)
+		}
+	}
+
 	var primary windows.Token
-	if err := windows.DuplicateTokenEx(user, windows.MAXIMUM_ALLOWED, nil, windows.SecurityImpersonation, windows.TokenPrimary, &primary); err != nil {
+	if err := windows.DuplicateTokenEx(src, windows.MAXIMUM_ALLOWED, nil, windows.SecurityImpersonation, windows.TokenPrimary, &primary); err != nil {
 		return 0, fmt.Errorf("DuplicateTokenEx: %w", err)
 	}
 	return primary, nil
 }
 
-// LaunchInSession starts o.Path in sessionID's desktop as that session's user,
-// with that user's own rights. Work needing privilege belongs in the service,
-// which already runs as LocalSystem.
+// LaunchInSession starts o.Path in sessionID's desktop as that session's user.
+// It runs with that user's own rights unless o.Elevated asks for the elevated
+// token. Work that needs privilege but no desktop belongs in the service, which
+// already runs as LocalSystem.
 // The process is wrapped in a kill-on-close job so it dies when the returned
 // Process is Closed (or when the service process exits). The caller must run as
 // LocalSystem.
@@ -124,7 +185,7 @@ func LaunchInSession(sessionID uint32, o LaunchOptions) (*Process, error) {
 	if o.Path == "" {
 		return nil, errors.New("winsvr: LaunchOptions.Path is required")
 	}
-	tok, err := userToken(sessionID)
+	tok, err := userToken(sessionID, o.Elevated)
 	if err != nil {
 		return nil, err
 	}
@@ -169,6 +230,13 @@ func LaunchInSession(sessionID uint32, o LaunchOptions) (*Process, error) {
 	var pi windows.ProcessInformation
 	if err := windows.CreateProcessAsUser(tok, exe16, cmd16, nil, nil, false, flags, env, dir16, &si, &pi); err != nil {
 		windows.CloseHandle(job)
+		if errors.Is(err, windows.ERROR_ELEVATION_REQUIRED) {
+			// The manifest asks for administrator and this token cannot supply
+			// it. Marked so Supervisor can tell this apart from every other way
+			// a launch fails; Windows' own message says elevation is required
+			// without saying by whom or what to do about it.
+			return nil, fmt.Errorf("%w: CreateProcessAsUser(%s): %w; set Supervisor.LaunchElevated to launch it with the user's elevated token", ErrElevationRequired, o.Path, err)
+		}
 		return nil, fmt.Errorf("CreateProcessAsUser(%s): %w", o.Path, err)
 	}
 	defer windows.CloseHandle(pi.Thread)

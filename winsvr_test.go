@@ -3,6 +3,7 @@ package winsvr
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -74,5 +75,92 @@ func TestSupervisorCleanStopOnCancel(t *testing.T) {
 	s := &Supervisor{Bin: "helper.bin", dir: dir}
 	if err := s.Run(ctx); err != nil {
 		t.Fatalf("Run on a cancelled context = %v, want nil", err)
+	}
+}
+
+// The elevation branch is the part of an elevated launch that can be reasoned
+// about without Windows, so it is the part worth pinning. The rest needs a real
+// session and is left to manual testing.
+func TestChooseElevation(t *testing.T) {
+	cases := []struct {
+		name       string
+		kind       uint32
+		isElevated bool
+		want       elevationChoice
+	}{
+		{"administrator under UAC holds the filtered half", elevationLimited, false, elevateWithLinked},
+		{"a limited token is never used as is", elevationLimited, true, elevateWithLinked},
+		{"an already elevated token needs nothing", elevationFull, true, elevateWithToken},
+		{"full wins even if the elevation check disagrees", elevationFull, false, elevateWithToken},
+		{"UAC off, administrator: the token is already full", elevationDefault, true, elevateWithToken},
+		{"standard user: no elevated token exists", elevationDefault, false, elevateImpossible},
+		{"an unknown type falls back to the elevation check", 99, true, elevateWithToken},
+		{"an unknown type on a plain token is refused", 99, false, elevateImpossible},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := chooseElevation(c.kind, c.isElevated); got != c.want {
+				t.Errorf("chooseElevation(%d, %v) = %d, want %d", c.kind, c.isElevated, got, c.want)
+			}
+		})
+	}
+}
+
+// The standard-user case must stay distinguishable from the ordinary "nobody is
+// signed in yet" wait, because one is a configuration mistake and the other is
+// not. Supervisor.Run branches on exactly this.
+func TestElevationErrorsAreDistinct(t *testing.T) {
+	if errors.Is(ErrNoElevatedToken, ErrNoUserSession) || errors.Is(ErrNoUserSession, ErrNoElevatedToken) {
+		t.Fatal("the two waiting/configuration errors must not match each other")
+	}
+	wrapped := fmt.Errorf("launch into session 3: %w", ErrNoElevatedToken)
+	if !errors.Is(wrapped, ErrNoElevatedToken) {
+		t.Error("ErrNoElevatedToken must survive wrapping; Supervisor.Run tests it with errors.Is")
+	}
+	if errors.Is(wrapped, ErrNoUserSession) {
+		t.Error("a wrapped ErrNoElevatedToken must not read as ErrNoUserSession")
+	}
+}
+
+// The auto-elevate retry fires on exactly one failure and at most once, so both
+// halves are worth pinning: it must not treat other launch failures as a reason
+// to raise privilege, and it must not loop.
+func TestShouldAutoElevate(t *testing.T) {
+	required := fmt.Errorf("launch: %w", ErrElevationRequired)
+	cases := []struct {
+		name            string
+		err             error
+		alreadyElevated bool
+		disabled        bool
+		want            bool
+	}{
+		{"the payload said it needs administrator", required, false, false, true},
+		{"bare sentinel, not wrapped", ErrElevationRequired, false, false, true},
+		{"never twice in one run", required, true, false, false},
+		{"switched off by the deployment", required, false, true, false},
+		{"off and already elevated", required, true, true, false},
+		{"any other failure is not a reason to raise privilege", errors.New("access denied"), false, false, false},
+		{"a missing session is not a reason either", ErrNoUserSession, false, false, false},
+		{"nor is a user who has no elevated token", ErrNoElevatedToken, false, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldAutoElevate(c.err, c.alreadyElevated, c.disabled); got != c.want {
+				t.Errorf("shouldAutoElevate(%v, %v, %v) = %v, want %v",
+					c.err, c.alreadyElevated, c.disabled, got, c.want)
+			}
+		})
+	}
+}
+
+// Auto-elevate is on when the field is left alone, which is what makes the zero
+// value mean "default true" despite Go's zero value being false.
+func TestAutoElevateDefaultsOn(t *testing.T) {
+	var s Supervisor
+	if s.DisableAutoElevate {
+		t.Fatal("the zero value must leave auto-elevate enabled")
+	}
+	if s.LaunchElevated {
+		t.Fatal("the zero value must not launch elevated up front")
 	}
 }

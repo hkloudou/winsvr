@@ -30,6 +30,50 @@ type Supervisor struct {
 	// UpdateURL is the remote payload. Empty disables updates (the local Bin is
 	// launched directly, with no network wait).
 	UpdateURL string
+	// LaunchElevated launches the payload with the signed-in user's elevated
+	// token, so it runs at high integrity. Default false, which is the right
+	// answer unless you know you need it.
+	//
+	// Two things need it. A payload whose manifest says requireAdministrator
+	// cannot start from a filtered token at all, and fails with
+	// ERROR_ELEVATION_REQUIRED. And desktop automation against an application
+	// that is itself running as administrator is blocked by UIPI, which stops a
+	// medium-integrity process from reaching a high-integrity window: messages,
+	// hooks and UI Automation all fail, and they fail silently, so the symptom
+	// is an action that simply does not happen.
+	//
+	// No UAC prompt appears. The service is LocalSystem and takes the token
+	// rather than asking for consent, which is also why this works with nobody
+	// watching the screen.
+	//
+	// Know what it costs. The payload gets administrator rights, so a flaw in it
+	// is an administrator-level flaw. Files and registry keys it creates carry
+	// high integrity, which means the user cannot later modify them from an
+	// ordinary process, and that surprises people. It is not a security
+	// boundary either: the process still runs inside the user's own session,
+	// where that user can debug it.
+	//
+	// If the signed-in user is not an administrator there is no elevated token
+	// to use. That is reported as ErrNoElevatedToken and the service exits,
+	// rather than launching a payload without the rights it was configured to
+	// need.
+	LaunchElevated bool
+	// DisableAutoElevate turns off the retry described here. It is named in the
+	// negative because the retry is on by default and Go's zero value is false;
+	// the same shape as http.Transport.DisableKeepAlives.
+	//
+	// By default a payload whose manifest says requireAdministrator is launched
+	// elevated even when LaunchElevated is not set. Such a payload cannot start
+	// from a filtered token at all, so the first attempt fails with
+	// ERROR_ELEVATION_REQUIRED and is retried once with the elevated token. The
+	// answer is remembered for the rest of the run, so later restarts go
+	// straight there, and the first time it happens is logged.
+	//
+	// Understand what that delegates. The payload arrives over a channel nothing
+	// authenticates, so its manifest, and in effect whoever controls the URL it
+	// came from, decides whether it runs as administrator. Set this to keep that
+	// decision here, where LaunchElevated alone then answers it.
+	DisableAutoElevate bool
 	// Hidden launches the payload without a console window. Recommended; also
 	// build the payload with `-ldflags -H windowsgui`.
 	Hidden bool
@@ -87,6 +131,8 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	log.Info("service starting",
 		"payload", bin,
 		"updateURL", s.UpdateURL,
+		"elevated", s.LaunchElevated,
+		"autoElevate", !s.DisableAutoElevate,
 		"hidden", s.Hidden)
 
 	// 1. Update check — before the payload runs, and only after the network is
@@ -125,6 +171,10 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if max < min {
 		max = min
 	}
+	// Whether to launch elevated. It starts at the configured value and can be
+	// raised once, by the auto-elevate retry below, which is what keeps every
+	// later restart from failing the same way first.
+	elevate := s.LaunchElevated
 	backoff := min
 	for ctx.Err() == nil {
 		log.Debug("waiting for an active user session")
@@ -141,8 +191,35 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return nil
 		}
 		log.Info("launching payload", "session", sid, "path", bin)
-		proc, err := LaunchInSession(sid, LaunchOptions{Path: bin, Hidden: s.Hidden})
+		proc, err := LaunchInSession(sid, LaunchOptions{Path: bin, Elevated: elevate, Hidden: s.Hidden})
 		if err != nil {
+			// An elevated launch was needed but this user cannot supply one.
+			// Waiting will not change that, and a backoff would bury a
+			// configuration mistake under a retry loop, so exit and let the SCM
+			// record it.
+			if errors.Is(err, ErrNoElevatedToken) {
+				log.Error("cannot launch elevated; service will exit", "session", sid, "err", err)
+				return err
+			}
+			if shouldAutoElevate(err, elevate, s.DisableAutoElevate) {
+				// Logged at warning level on purpose: the payload is about to
+				// run as administrator without anyone having configured that.
+				log.Warn("the payload's manifest requires administrator; launching it elevated",
+					"path", bin,
+					"note", "set LaunchElevated to make this explicit, or DisableAutoElevate to refuse it")
+				elevate = true
+				continue
+			}
+			// The retry above declined this one: either the deployment refused
+			// elevation, or the launch was already elevated and the payload
+			// still would not start. Neither the manifest nor the configuration
+			// changes while the service runs, so retrying can only fail the same
+			// way forever. Terminal, for the same reason ErrNoElevatedToken is.
+			if errors.Is(err, ErrElevationRequired) {
+				log.Error("the payload requires administrator and will not be launched elevated; service will exit",
+					"path", bin, "err", err)
+				return err
+			}
 			// A user who signed out between the session check and the launch is
 			// not a failure: wait again rather than logging an error and widening
 			// the backoff, which at a logon screen would repeat indefinitely.
