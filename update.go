@@ -204,7 +204,16 @@ func (u *Updater) check(ctx context.Context) (bool, error) {
 
 // matchesInstalled reports whether the payload on disk is still the one whose
 // checksum was recorded. A missing or unreadable file does not match.
+//
+// An empty file never matches, whatever was recorded. It cannot run, and an
+// earlier version could install one and record it as good: its checksum is
+// zero, which is also what an absent checksum reads back as. Refusing to match
+// it here is what makes a machine already stuck that way download again, rather
+// than only stopping new ones from getting stuck.
 func (u *Updater) matchesInstalled(want uint64) bool {
+	if fi, err := os.Stat(u.Path); err != nil || fi.Size() == 0 {
+		return false
+	}
 	got, err := fileCRC64(u.Path)
 	return err == nil && got == want
 }

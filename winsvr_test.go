@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestServiceStateString(t *testing.T) {
@@ -217,5 +218,45 @@ func TestGrowNeverGoesNegative(t *testing.T) {
 		if got := grow(cur, math.MaxInt64); got <= 0 {
 			t.Errorf("grow(%d, MaxInt64) = %d, went non-positive", cur, got)
 		}
+	}
+}
+
+type panicWith struct{ v any }
+
+func (p panicWith) Run(context.Context) error { panic(p.v) }
+
+// Only the stack used to be bounded, so a huge panic value could still make the
+// error too long for one event-log record, and losing the record loses the
+// panic. The value also must not crowd the stack out.
+func TestRunRecoveredBoundsAHugeValue(t *testing.T) {
+	err := runRecovered(context.Background(), panicWith{strings.Repeat("x", 200<<10)})
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	msg := err.Error()
+	if len(msg) > maxEventLen {
+		t.Errorf("message is %d bytes, over one event-log record (%d)", len(msg), maxEventLen)
+	}
+	if !strings.Contains(msg, "panicWith.Run") {
+		t.Error("the stack was pushed out by the value")
+	}
+}
+
+func TestEventText(t *testing.T) {
+	if got := eventText("a\x00b"); got != `a\x00b` {
+		t.Errorf("NUL: got %q, want it shown rather than failing the record", got)
+	}
+	long := eventText(strings.Repeat("字", maxEventLen)) // 3 bytes each
+	if len(long) > maxEventLen+32 {
+		t.Errorf("long text is %d bytes, not bounded", len(long))
+	}
+	if !utf8.ValidString(long) {
+		t.Error("truncation split a character")
+	}
+	if !strings.HasSuffix(long, "(truncated)") {
+		t.Error("truncation should say so")
+	}
+	if got := eventText("plain"); got != "plain" {
+		t.Errorf("ordinary text changed: %q", got)
 	}
 }

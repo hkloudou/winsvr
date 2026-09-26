@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"strings"
 	"time"
 )
 
@@ -51,10 +52,38 @@ type Logged interface {
 	ServiceLogger() *slog.Logger
 }
 
-// maxPanicStack bounds the stack kept from a recovered panic. It has to fit in
-// one event-log record, which refuses anything much over 31K characters, and a
-// record that fails to write would lose the panic all over again.
-const maxPanicStack = 16 << 10
+// Bounds on what a recovered panic contributes to its error. Together they stay
+// well inside one event-log record. The value gets its own, smaller share so
+// that a huge one cannot push the stack out entirely: the stack is what says
+// where.
+const (
+	maxPanicValue = 4 << 10
+	maxPanicStack = 16 << 10
+)
+
+// maxEventLen keeps one event-log record under ReportEvent's limit of 31,839
+// characters per string. It counts bytes, which are never fewer than the UTF-16
+// units Windows counts, so it is safe for any text.
+const maxEventLen = 31000
+
+// truncate shortens s to at most n bytes, cutting on a character boundary and
+// saying that it did.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return strings.ToValidUTF8(s[:n], "") + " …(truncated)"
+}
+
+// eventText makes a message safe to hand to the event log. Both problems it
+// handles would otherwise lose the line silently, because ReportEvent's failure
+// comes back as a handler error and slog discards that: a NUL inside the text
+// fails the conversion to a NUL-terminated string, and an over-long one is
+// refused outright. A NUL is shown rather than dropped, since its presence is
+// usually the interesting part.
+func eventText(s string) string {
+	return truncate(strings.ReplaceAll(s, "\x00", `\x00`), maxEventLen)
+}
 
 // runRecovered calls svc.Run and turns a panic into an error.
 //
@@ -67,11 +96,9 @@ const maxPanicStack = 16 << 10
 func runRecovered(ctx context.Context, svc Service) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			stack := debug.Stack()
-			if len(stack) > maxPanicStack {
-				stack = stack[:maxPanicStack]
-			}
-			err = fmt.Errorf("winsvr: the service panicked: %v\n%s", r, stack)
+			value := truncate(fmt.Sprint(r), maxPanicValue)
+			stack := truncate(string(debug.Stack()), maxPanicStack)
+			err = fmt.Errorf("winsvr: the service panicked: %s\n%s", value, stack)
 		}
 	}()
 	return svc.Run(ctx)

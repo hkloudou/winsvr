@@ -506,3 +506,35 @@ func TestUpdaterRefusesAnEmptyBody(t *testing.T) {
 		t.Error("no state may be recorded, or the empty payload would stick")
 	}
 }
+
+// A machine that already installed an empty payload under an earlier version has
+// it recorded as good: the state holds the current ETag, and a zero checksum,
+// which is also what an absent one reads back as. The download-time guard never
+// runs for it, because the check calls it up to date. It has to be caught here.
+func TestUpdaterRepairsAnAlreadyEmptyPayload(t *testing.T) {
+	const body = "the real payload"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		if r.Method == http.MethodGet {
+			fmt.Fprint(w, body)
+		}
+	}))
+	defer srv.Close()
+
+	u := &Updater{URL: srv.URL, Path: filepath.Join(t.TempDir(), "helper.bin")}
+	// Exactly what the old bug left behind.
+	if err := os.WriteFile(u.Path, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.saveState(payloadInfo{ETag: `"v1"`, CRC64: 0}); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := u.EnsureLatest(context.Background())
+	if err != nil || !updated {
+		t.Fatalf("EnsureLatest = %v,%v, want a repairing download", updated, err)
+	}
+	if got, _ := os.ReadFile(u.Path); string(got) != body {
+		t.Fatalf("payload is %q, want it repaired to %q", got, body)
+	}
+}
