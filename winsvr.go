@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -102,6 +103,24 @@ func runRecovered(ctx context.Context, svc Service) (err error) {
 		}
 	}()
 	return svc.Run(ctx)
+}
+
+// serviceLogger returns the logger framework events about svc should go to.
+//
+// That is svc's own logger when it has one that will actually record an error.
+// Otherwise it is stderr, never a logger that discards: a recovered panic is
+// written here, and discarding it would make it vanish. Checking only for the
+// Logged interface is not enough, because a Supervisor with no Logger set
+// implements it and still discards. In console mode stderr is the terminal,
+// which is where an unrecovered panic used to appear; as a service it is
+// connected to nothing, which is no worse than before.
+func serviceLogger(svc Service) *slog.Logger {
+	if lg, ok := svc.(Logged); ok {
+		if l := lg.ServiceLogger(); l != nil && l.Enabled(context.Background(), slog.LevelError) {
+			return l
+		}
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, nil))
 }
 
 // Service is what you implement. Run is called once and must block until ctx is

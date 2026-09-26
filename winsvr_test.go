@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -258,5 +259,32 @@ func TestEventText(t *testing.T) {
 	}
 	if got := eventText("plain"); got != "plain" {
 		t.Errorf("ordinary text changed: %q", got)
+	}
+}
+
+type loggedNil struct{ fine }
+
+func (loggedNil) ServiceLogger() *slog.Logger { return nil }
+
+// A recovered panic is written to this logger, so it must never be one that
+// discards. Checking only for the Logged interface would miss a Supervisor with
+// no Logger set, which implements it and still discards.
+func TestServiceLoggerNeverDiscards(t *testing.T) {
+	ctx := context.Background()
+	for name, svc := range map[string]Service{
+		"a Service that does not implement Logged": fine{},
+		"a Supervisor with no Logger":              &Supervisor{Bin: "helper.bin"},
+		"a Logged that returns nil":                loggedNil{},
+	} {
+		if !serviceLogger(svc).Enabled(ctx, slog.LevelError) {
+			t.Errorf("%s: got a logger that would discard an error", name)
+		}
+	}
+
+	var buf strings.Builder
+	own := slog.New(slog.NewTextHandler(&buf, nil))
+	serviceLogger(&Supervisor{Bin: "helper.bin", Logger: own}).Error("panicked here")
+	if !strings.Contains(buf.String(), "panicked here") {
+		t.Error("a service with a working logger must keep getting its own")
 	}
 }
