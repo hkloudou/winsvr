@@ -314,11 +314,14 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// grow doubles a backoff, capped at max. It compares before doubling: doubling
+// first can overflow into a negative duration, and a negative sleep returns at
+// once, which would turn a very long configured backoff into a tight loop.
 func grow(cur, max time.Duration) time.Duration {
-	if cur *= 2; cur > max {
+	if cur > max/2 {
 		return max
 	}
-	return cur
+	return cur * 2
 }
 
 // discardHandler drops all log records.

@@ -35,14 +35,8 @@ type handler struct {
 	stopTimeout time.Duration
 }
 
-// log returns the service's own logger when it offers one, so framework-level
-// events land wherever the rest of its output goes, and a no-op otherwise.
-func (h *handler) log() *slog.Logger {
-	if lg, ok := h.svc.(Logged); ok {
-		return lg.ServiceLogger()
-	}
-	return slog.New(discardHandler{})
-}
+// log returns where framework-level events go; see serviceLogger.
+func (h *handler) log() *slog.Logger { return serviceLogger(h.svc) }
 
 func (h *handler) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- svc.Status) (bool, uint32) {
 	const accepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPreShutdown
@@ -51,7 +45,7 @@ func (h *handler) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- h.svc.Run(ctx) }()
+	go func() { done <- runRecovered(ctx, h.svc) }()
 
 	s <- svc.Status{State: svc.Running, Accepts: accepted}
 	for {

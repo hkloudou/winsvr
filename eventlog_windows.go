@@ -73,7 +73,7 @@ func (h *eventLogHandler) Handle(_ context.Context, r slog.Record) error {
 		fmt.Fprintf(&b, " %s=%v", a.Key, a.Value)
 	}
 	r.Attrs(func(a slog.Attr) bool { fmt.Fprintf(&b, " %s%s=%v", h.prefix, a.Key, a.Value); return true })
-	switch msg := b.String(); {
+	switch msg := eventText(b.String()); {
 	case r.Level >= slog.LevelError:
 		return h.log.Error(eidError, msg)
 	case r.Level >= slog.LevelWarn:

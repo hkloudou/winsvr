@@ -185,6 +185,27 @@ func LaunchInSession(sessionID uint32, o LaunchOptions) (*Process, error) {
 	if o.Path == "" {
 		return nil, errors.New("winsvr: LaunchOptions.Path is required")
 	}
+	// Convert up front, before any handle exists to clean up. A NUL byte makes
+	// the conversion fail, and ignoring that used to hand CreateProcessAsUser a
+	// nil command line, which starts the program anyway with every argument
+	// silently dropped.
+	dir := o.Dir
+	if dir == "" {
+		dir = filepath.Dir(o.Path)
+	}
+	exe16, err := windows.UTF16PtrFromString(o.Path)
+	if err != nil {
+		return nil, fmt.Errorf("winsvr: LaunchOptions.Path %q: %w", o.Path, err)
+	}
+	cmd16, err := windows.UTF16PtrFromString(windows.ComposeCommandLine(append([]string{o.Path}, o.Args...)))
+	if err != nil {
+		return nil, fmt.Errorf("winsvr: LaunchOptions.Args: %w", err)
+	}
+	dir16, err := windows.UTF16PtrFromString(dir)
+	if err != nil {
+		return nil, fmt.Errorf("winsvr: LaunchOptions.Dir %q: %w", dir, err)
+	}
+
 	tok, err := userToken(sessionID, o.Elevated)
 	if err != nil {
 		return nil, err
@@ -219,13 +240,6 @@ func LaunchInSession(sessionID uint32, o LaunchOptions) (*Process, error) {
 		si.Flags |= windows.STARTF_USESHOWWINDOW
 		si.ShowWindow = windows.SW_SHOWNORMAL
 	}
-	dir := o.Dir
-	if dir == "" {
-		dir = filepath.Dir(o.Path)
-	}
-	exe16, _ := windows.UTF16PtrFromString(o.Path)
-	cmd16, _ := windows.UTF16PtrFromString(windows.ComposeCommandLine(append([]string{o.Path}, o.Args...)))
-	dir16, _ := windows.UTF16PtrFromString(dir)
 
 	var pi windows.ProcessInformation
 	if err := windows.CreateProcessAsUser(tok, exe16, cmd16, nil, nil, false, flags, env, dir16, &si, &pi); err != nil {

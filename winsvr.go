@@ -16,6 +16,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"runtime/debug"
+	"strings"
 	"time"
 )
 
@@ -48,6 +51,76 @@ var ErrElevationRequired = errors.New("winsvr: the payload requires administrato
 // Supervisor implements it.
 type Logged interface {
 	ServiceLogger() *slog.Logger
+}
+
+// Bounds on what a recovered panic contributes to its error. Together they stay
+// well inside one event-log record. The value gets its own, smaller share so
+// that a huge one cannot push the stack out entirely: the stack is what says
+// where.
+const (
+	maxPanicValue = 4 << 10
+	maxPanicStack = 16 << 10
+)
+
+// maxEventLen keeps one event-log record under ReportEvent's limit of 31,839
+// characters per string. It counts bytes, which are never fewer than the UTF-16
+// units Windows counts, so it is safe for any text.
+const maxEventLen = 31000
+
+// truncate shortens s to at most n bytes, cutting on a character boundary and
+// saying that it did.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return strings.ToValidUTF8(s[:n], "") + " …(truncated)"
+}
+
+// eventText makes a message safe to hand to the event log. Both problems it
+// handles would otherwise lose the line silently, because ReportEvent's failure
+// comes back as a handler error and slog discards that: a NUL inside the text
+// fails the conversion to a NUL-terminated string, and an over-long one is
+// refused outright. A NUL is shown rather than dropped, since its presence is
+// usually the interesting part.
+func eventText(s string) string {
+	return truncate(strings.ReplaceAll(s, "\x00", `\x00`), maxEventLen)
+}
+
+// runRecovered calls svc.Run and turns a panic into an error.
+//
+// A service's Run executes on a goroutine of its own, where a panic ends the
+// whole process, and under the service control manager stderr is connected to
+// nothing. So the cause would be lost entirely, leaving only "terminated
+// unexpectedly" in the system log. As an error it is logged instead, and
+// reported as a failed exit, so the recovery action fires and someone can see
+// why. It also covers a nil Service, whose Run would panic the same way.
+func runRecovered(ctx context.Context, svc Service) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			value := truncate(fmt.Sprint(r), maxPanicValue)
+			stack := truncate(string(debug.Stack()), maxPanicStack)
+			err = fmt.Errorf("winsvr: the service panicked: %s\n%s", value, stack)
+		}
+	}()
+	return svc.Run(ctx)
+}
+
+// serviceLogger returns the logger framework events about svc should go to.
+//
+// That is svc's own logger when it has one that will actually record an error.
+// Otherwise it is stderr, never a logger that discards: a recovered panic is
+// written here, and discarding it would make it vanish. Checking only for the
+// Logged interface is not enough, because a Supervisor with no Logger set
+// implements it and still discards. In console mode stderr is the terminal,
+// which is where an unrecovered panic used to appear; as a service it is
+// connected to nothing, which is no worse than before.
+func serviceLogger(svc Service) *slog.Logger {
+	if lg, ok := svc.(Logged); ok {
+		if l := lg.ServiceLogger(); l != nil && l.Enabled(context.Background(), slog.LevelError) {
+			return l
+		}
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, nil))
 }
 
 // Service is what you implement. Run is called once and must block until ctx is

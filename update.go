@@ -8,6 +8,7 @@ import (
 	"hash/crc64"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -203,7 +204,16 @@ func (u *Updater) check(ctx context.Context) (bool, error) {
 
 // matchesInstalled reports whether the payload on disk is still the one whose
 // checksum was recorded. A missing or unreadable file does not match.
+//
+// An empty file never matches, whatever was recorded. It cannot run, and an
+// earlier version could install one and record it as good: its checksum is
+// zero, which is also what an absent checksum reads back as. Refusing to match
+// it here is what makes a machine already stuck that way download again, rather
+// than only stopping new ones from getting stuck.
 func (u *Updater) matchesInstalled(want uint64) bool {
+	if fi, err := os.Stat(u.Path); err != nil || fi.Size() == 0 {
+		return false
+	}
 	got, err := fileCRC64(u.Path)
 	return err == nil && got == want
 }
@@ -317,8 +327,14 @@ func (u *Updater) fetch(ctx context.Context, want payloadInfo) (string, payloadI
 	}
 
 	// Read one byte past the limit, so an oversized body is reported rather than
-	// silently truncated into a corrupt payload.
-	n, err := io.Copy(tmp, io.LimitReader(resp.Body, limit+1))
+	// silently truncated into a corrupt payload. Not past math.MaxInt64, though:
+	// that is the natural way to ask for no limit, and adding one wraps it to a
+	// negative count, which reads nothing at all.
+	readLimit := limit
+	if readLimit < math.MaxInt64 {
+		readLimit++
+	}
+	n, err := io.Copy(tmp, io.LimitReader(resp.Body, readLimit))
 	if err == nil && n > limit {
 		err = fmt.Errorf("update: %s is larger than the %d byte limit", u.URL, limit)
 	}
@@ -327,6 +343,14 @@ func (u *Updater) fetch(ctx context.Context, want payloadInfo) (string, payloadI
 	}
 	if err != nil {
 		return fail(err)
+	}
+	// An empty file is never a payload that can run, and installing one would
+	// also be permanent: its checksum is zero, which is exactly what an absent
+	// checksum reads back as, so every later check would find it up to date. So
+	// refuse it whatever produced it, the limit above or a zero-length object
+	// left behind by a failed upload.
+	if n == 0 {
+		return fail(fmt.Errorf("update: %s returned an empty body; refusing to install it", u.URL))
 	}
 	// The server publishes no checksum, so this one is ours: recording what was
 	// installed is what lets a later local change be noticed.

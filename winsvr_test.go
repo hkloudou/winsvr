@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestServiceStateString(t *testing.T) {
@@ -162,5 +166,125 @@ func TestAutoElevateDefaultsOn(t *testing.T) {
 	}
 	if s.LaunchElevated {
 		t.Fatal("the zero value must not launch elevated up front")
+	}
+}
+
+type panicky struct{}
+
+func (panicky) Run(context.Context) error { panic("boom") }
+
+type fine struct{ err error }
+
+func (f fine) Run(context.Context) error { return f.err }
+
+// A panic in Run would end the process, and as a service its stderr goes
+// nowhere, so the cause has to come back as an error that can be logged.
+func TestRunRecoveredTurnsAPanicIntoAnError(t *testing.T) {
+	err := runRecovered(context.Background(), panicky{})
+	if err == nil {
+		t.Fatal("a panic must come back as an error, not escape")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "boom") {
+		t.Errorf("the panic value is missing from %q", msg)
+	}
+	if !strings.Contains(msg, "panicky.Run") {
+		t.Error("the stack is missing; without it the error says what but not where")
+	}
+	if len(msg) > maxPanicStack+256 {
+		t.Errorf("message is %d bytes, over what one event-log record can hold", len(msg))
+	}
+}
+
+func TestRunRecoveredNilService(t *testing.T) {
+	if err := runRecovered(context.Background(), nil); err == nil {
+		t.Fatal("a nil Service must be reported, not crash the process")
+	}
+}
+
+func TestRunRecoveredPassesThroughOrdinaryResults(t *testing.T) {
+	if err := runRecovered(context.Background(), fine{}); err != nil {
+		t.Errorf("a clean return became %v", err)
+	}
+	want := errors.New("ordinary failure")
+	if err := runRecovered(context.Background(), fine{want}); !errors.Is(err, want) {
+		t.Errorf("an ordinary error came back as %v", err)
+	}
+}
+
+// Doubling before comparing overflowed into a negative duration, and a negative
+// sleep returns at once.
+func TestGrowNeverGoesNegative(t *testing.T) {
+	for _, cur := range []time.Duration{math.MaxInt64 / 2, math.MaxInt64/2 + 1, math.MaxInt64 - 1, math.MaxInt64} {
+		if got := grow(cur, math.MaxInt64); got <= 0 {
+			t.Errorf("grow(%d, MaxInt64) = %d, went non-positive", cur, got)
+		}
+	}
+}
+
+type panicWith struct{ v any }
+
+func (p panicWith) Run(context.Context) error { panic(p.v) }
+
+// Only the stack used to be bounded, so a huge panic value could still make the
+// error too long for one event-log record, and losing the record loses the
+// panic. The value also must not crowd the stack out.
+func TestRunRecoveredBoundsAHugeValue(t *testing.T) {
+	err := runRecovered(context.Background(), panicWith{strings.Repeat("x", 200<<10)})
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	msg := err.Error()
+	if len(msg) > maxEventLen {
+		t.Errorf("message is %d bytes, over one event-log record (%d)", len(msg), maxEventLen)
+	}
+	if !strings.Contains(msg, "panicWith.Run") {
+		t.Error("the stack was pushed out by the value")
+	}
+}
+
+func TestEventText(t *testing.T) {
+	if got := eventText("a\x00b"); got != `a\x00b` {
+		t.Errorf("NUL: got %q, want it shown rather than failing the record", got)
+	}
+	long := eventText(strings.Repeat("字", maxEventLen)) // 3 bytes each
+	if len(long) > maxEventLen+32 {
+		t.Errorf("long text is %d bytes, not bounded", len(long))
+	}
+	if !utf8.ValidString(long) {
+		t.Error("truncation split a character")
+	}
+	if !strings.HasSuffix(long, "(truncated)") {
+		t.Error("truncation should say so")
+	}
+	if got := eventText("plain"); got != "plain" {
+		t.Errorf("ordinary text changed: %q", got)
+	}
+}
+
+type loggedNil struct{ fine }
+
+func (loggedNil) ServiceLogger() *slog.Logger { return nil }
+
+// A recovered panic is written to this logger, so it must never be one that
+// discards. Checking only for the Logged interface would miss a Supervisor with
+// no Logger set, which implements it and still discards.
+func TestServiceLoggerNeverDiscards(t *testing.T) {
+	ctx := context.Background()
+	for name, svc := range map[string]Service{
+		"a Service that does not implement Logged": fine{},
+		"a Supervisor with no Logger":              &Supervisor{Bin: "helper.bin"},
+		"a Logged that returns nil":                loggedNil{},
+	} {
+		if !serviceLogger(svc).Enabled(ctx, slog.LevelError) {
+			t.Errorf("%s: got a logger that would discard an error", name)
+		}
+	}
+
+	var buf strings.Builder
+	own := slog.New(slog.NewTextHandler(&buf, nil))
+	serviceLogger(&Supervisor{Bin: "helper.bin", Logger: own}).Error("panicked here")
+	if !strings.Contains(buf.String(), "panicked here") {
+		t.Error("a service with a working logger must keep getting its own")
 	}
 }
