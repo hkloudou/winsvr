@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -162,5 +164,58 @@ func TestAutoElevateDefaultsOn(t *testing.T) {
 	}
 	if s.LaunchElevated {
 		t.Fatal("the zero value must not launch elevated up front")
+	}
+}
+
+type panicky struct{}
+
+func (panicky) Run(context.Context) error { panic("boom") }
+
+type fine struct{ err error }
+
+func (f fine) Run(context.Context) error { return f.err }
+
+// A panic in Run would end the process, and as a service its stderr goes
+// nowhere, so the cause has to come back as an error that can be logged.
+func TestRunRecoveredTurnsAPanicIntoAnError(t *testing.T) {
+	err := runRecovered(context.Background(), panicky{})
+	if err == nil {
+		t.Fatal("a panic must come back as an error, not escape")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "boom") {
+		t.Errorf("the panic value is missing from %q", msg)
+	}
+	if !strings.Contains(msg, "panicky.Run") {
+		t.Error("the stack is missing; without it the error says what but not where")
+	}
+	if len(msg) > maxPanicStack+256 {
+		t.Errorf("message is %d bytes, over what one event-log record can hold", len(msg))
+	}
+}
+
+func TestRunRecoveredNilService(t *testing.T) {
+	if err := runRecovered(context.Background(), nil); err == nil {
+		t.Fatal("a nil Service must be reported, not crash the process")
+	}
+}
+
+func TestRunRecoveredPassesThroughOrdinaryResults(t *testing.T) {
+	if err := runRecovered(context.Background(), fine{}); err != nil {
+		t.Errorf("a clean return became %v", err)
+	}
+	want := errors.New("ordinary failure")
+	if err := runRecovered(context.Background(), fine{want}); !errors.Is(err, want) {
+		t.Errorf("an ordinary error came back as %v", err)
+	}
+}
+
+// Doubling before comparing overflowed into a negative duration, and a negative
+// sleep returns at once.
+func TestGrowNeverGoesNegative(t *testing.T) {
+	for _, cur := range []time.Duration{math.MaxInt64 / 2, math.MaxInt64/2 + 1, math.MaxInt64 - 1, math.MaxInt64} {
+		if got := grow(cur, math.MaxInt64); got <= 0 {
+			t.Errorf("grow(%d, MaxInt64) = %d, went non-positive", cur, got)
+		}
 	}
 }

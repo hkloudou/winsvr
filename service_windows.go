@@ -51,7 +51,7 @@ func (h *handler) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- sv
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- h.svc.Run(ctx) }()
+	go func() { done <- runRecovered(ctx, h.svc) }()
 
 	s <- svc.Status{State: svc.Running, Accepts: accepted}
 	for {

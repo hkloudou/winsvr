@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"time"
 )
 
@@ -48,6 +49,32 @@ var ErrElevationRequired = errors.New("winsvr: the payload requires administrato
 // Supervisor implements it.
 type Logged interface {
 	ServiceLogger() *slog.Logger
+}
+
+// maxPanicStack bounds the stack kept from a recovered panic. It has to fit in
+// one event-log record, which refuses anything much over 31K characters, and a
+// record that fails to write would lose the panic all over again.
+const maxPanicStack = 16 << 10
+
+// runRecovered calls svc.Run and turns a panic into an error.
+//
+// A service's Run executes on a goroutine of its own, where a panic ends the
+// whole process, and under the service control manager stderr is connected to
+// nothing. So the cause would be lost entirely, leaving only "terminated
+// unexpectedly" in the system log. As an error it is logged instead, and
+// reported as a failed exit, so the recovery action fires and someone can see
+// why. It also covers a nil Service, whose Run would panic the same way.
+func runRecovered(ctx context.Context, svc Service) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			if len(stack) > maxPanicStack {
+				stack = stack[:maxPanicStack]
+			}
+			err = fmt.Errorf("winsvr: the service panicked: %v\n%s", r, stack)
+		}
+	}()
+	return svc.Run(ctx)
 }
 
 // Service is what you implement. Run is called once and must block until ctx is
